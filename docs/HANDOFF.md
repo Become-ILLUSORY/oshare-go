@@ -194,18 +194,27 @@ Helper scripts used on the device are not committed; re-create them if needed:
 
 ## 9. Open tasks (in order)
 
-1. **Run the BLE experiment on the CachyOS laptop.**
+1. **BLE experiment — milestone reached 2026-10-21.**
    ```sh
-   sudo pacman -S bluez bluez-utils python-dbus python-gobject
-   sudo systemctl enable --now bluetooth
-   sudo python3 tools/oshare_ble.py scan -t 20     # reference adverts
-   sudo python3 tools/oshare_ble.py serve --name LinuxBox
+   python3 tools/oshare_ble.py scan -t 20          # reference adverts
+   python3 tools/oshare_ble.py serve --name LinuxBox
    ```
-   Expected: the phone's 互传 → 发送页 → 其他设备 lists `LinuxBox`; tapping it
-   should produce `write START_WPS_INFO` and `write PORT_FREQUENCY` on the
-   laptop. These carry the Wi-Fi Direct SSID/PSK and the TLS port.
-   If it does not appear, sweep `--adv-flags` (0x02/0x04/0x06/0x11) and compare
-   with the phone's own advert from `scan`.
+   No root needed any more: the tool talks to bluetoothd over the system
+   D-Bus and only requires `python-gobject`.
+
+   **Verified on a realme GT7 Pro**: `LinuxBox` shows up under 其他设备, the
+   phone connects, reads `0x9996`, and writes its 74-byte share request to
+   `0x9985`. The advertisement must stay inside 31 bytes and be split across
+   ADV_IND/SCAN_RSP — see the "Legacy packet budget" section of
+   [BLE.md](BLE.md) for the exact layout and why extended advertising is
+   invisible to the phone.
+
+   **Blocking**: the phone never writes the CCC descriptor for `0x9985`, so
+   bluez drops our `ok` notification and the phone reports 发送超时/对方未确认.
+   The phone's own exploration shows no `0x2902` under service `0x9999`.
+   Next: register the service without explicit handles, or expose the CCCD
+   explicitly, and confirm with `gdbus`/`dbus-monitor` that `StartNotify`
+   arrives.
 
 2. **Parse the credentials and join the group** (new Go code, `p2p/`):
    `wpa_cli p2p_connect` / `p2p_group_add`+`p2p_join`, or NetworkManager, then

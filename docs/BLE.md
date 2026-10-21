@@ -140,14 +140,71 @@ device id; when the connection is paired the JSON is additionally signed
 
 ## Consequence for a Linux peer
 
-1. Advertise service UUID `0x8881` first + service data `0x6666`/`0x6667` with
-   `advBrandType = 802`.
+1. Advertise service UUID `0x8881` **plus the service-data UUIDs** and split
+   the two payloads across ADV_IND and SCAN_RSP (see "Legacy packet budget").
 2. Host a GATT server with service `0x9999` (and `0x9955`) exposing the
-   characteristics above; the phone will connect, subscribe to `0x9989`/
-   `0x9985`/`0x9997` and write to `0x9986`/`0x9953`.
+   characteristics above; the phone will connect, read `0x9996`, subscribe to
+   `0x9985`/`0x9989` and write its share request to `0x9985`.
 3. Parse the written Wi-Fi credentials, join the Wi-Fi Direct group the phone
    creates, then run the TLS client from `transfer/` against
    `https://<phone>:<port>/download?taskId=…`.
 
-`tools/ble_scan.py` and `tools/ble_peer.py` in this repository implement the
-first steps on BlueZ (Linux).
+`tools/oshare_ble.py` implements steps 1 and 2 on BlueZ (Linux).
+
+## Legacy packet budget (verified 2026-10-21)
+
+BlueZ switches an advertisement to **extended advertising** as soon as the
+ADV_IND payload exceeds 31 bytes (`src/advertising.c`: `bt_ad_length() >
+BT_AD_MAX_DATA_LEN` forces `MGMT_ADV_FLAG_SEC_1M`). The ColorOS scanner uses
+`SCAN_MODE_LOW_LATENCY` with `LEGACY = true`, so it **never reports** extended
+PDUs: the phone's Bluetooth stack does receive them (it logs
+`btm_ble_process_adv_addr`), but nothing reaches `ScanRecord`, so
+`BleScannerImpl` logs only `byteData is null`.
+
+Two further traps found on the way:
+
+* `0x6666` (24 B) + `0x6667` (20 B) cannot share one legacy packet. BlueZ's
+  `ScanResponseServiceData` property puts one of them into the scan response;
+  Android merges ADV_IND + SCAN_RSP back into a single `ScanRecord`, which is
+  exactly what `o.q()` expects.
+* A `Discoverable`/`LocalName` property makes BlueZ append a Flags AD (3 B)
+  and a name AD on top, pushing the packet over the limit again.
+
+Layout that the phone accepts (`tools/oshare_ble.py serve`):
+
+```
+ADV_IND : Flags | UUID16 list [6666, 6667] | ServiceData 0x6667        ~31 B
+SCAN_RSP:                                   ServiceData 0x6666        ~27 B
+```
+
+`ServiceUUIDs` matters twice: the scanner's `ScanFilter` is built from
+`00008881`, `00006667`, `00003333`, `00003331` (dumpsys `LE Scanner`), but
+`ScanRecord.getServiceUuids()` is what makes the app treat the peer as a
+share target at all — service data alone shows up in `ScanRecord` but not in
+the device list.
+
+## GATT session as observed
+
+After service discovery the phone (as the GATT client) runs:
+
+```
+read   0x9996 (WIFI_INFO)   -> expects {"state":0,"mac":"<12 hex>","key":""}
+write  0x9985 (ACK_DIALOG)  -> 66-byte share request, '&'-separated:
+                               66&1&11&<device name>&...&<mime>&<size>&<contact hash>
+notify 0x9985               -> receiver's verdict: Base64("ok" | "no" | "time")
+```
+
+The share request is `w.e.y()`'s format: `count`, `type`, `version`, device
+name, …, mime, size, and the sender's contact hash. `0x9985` is written with
+`setCharacteristicNotification()` immediately before the write, i.e. the phone
+expects the answer on the same characteristic.
+
+Open problem (2026-10-21): the phone calls
+`setCharacteristicNotification(0x9985, true)` but the GATT exploration on the
+phone (`bta_gattc_display_explore_record`) lists **no 0x2902 descriptor** for
+the `0x9999` service — only the GAP service shows one. Without a CCC write
+BlueZ refuses to emit the notification, so the phone times out with
+"对方未确认". BlueZ does create the CCCD on `RegisterApplication`
+(`database_add_ccc()`), so the descriptor is either not advertised because
+the service was registered with an explicit handle, or the phone reuses a
+stale cache from `/data/misc/bluetooth/gatt_cache_*`.
