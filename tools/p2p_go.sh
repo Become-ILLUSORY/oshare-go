@@ -117,34 +117,11 @@ if command -v iptables >/dev/null 2>&1; then
     }
 fi
 
-# --- 4. TLS server on the port the phone was told ------------------------
+# --- 4. HTTPS + WebSocket control channel --------------------------------
 if [ ! -f "$CERT" ]; then
     openssl req -x509 -newkey rsa:2048 -keyout "$KEY" -out "$CERT" -days 3650 \
         -nodes -subj "/CN=localhost" 2>/dev/null
     say "generated self-signed cert ($CERT)"
 fi
-say "serving https://${GO_IP%%/*}:$PORT/"
-exec python3 -I - "$PORT" <<'PY'
-import http.server, ssl, sys, time
-port = int(sys.argv[1])
-
-class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        print(f"GET {self.path}", flush=True)
-        for k, v in self.headers.items():
-            print(f"    {k}: {v}", flush=True)
-        body = b'{"result":0}'
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-    def log_message(self, *a):
-        pass
-
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-ctx.load_cert_chain("/tmp/oshare-srv.crt", "/tmp/oshare-srv.key")
-srv = http.server.HTTPServer(("0.0.0.0", port), H)
-srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-print(f"listening on {port}", flush=True)
-srv.serve_forever()
-PY
+say "serving wss://${GO_IP%%/*}:$PORT/websocket"
+exec python3 -I "$(dirname "$0")/oshare_ws.py" --port "$PORT" --cert "$CERT" --key "$KEY"
