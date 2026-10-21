@@ -1295,3 +1295,92 @@ SSID/PSK 由协商结果决定。
 请确认这一点——如果是对的，`p2p_go.sh` 里 SSID 随便填，PSK 也无关紧要；
 如果 `type` 需要 < 20 才会用我们的 ssid/psk，那 `z()` 的算法
 （`ssid.endsWith("fastCon") ? 42 : ...`）要改，我们就不再让 ssid 以 fastCon 结尾。
+
+---
+
+# 第十三轮：P2P 关联成功了，DHCP 卡住（防火墙/转发待查）
+
+## 好消息：P2P 层完全打通
+
+`p2p_go.sh`（修好 `--bind-dynamic` 之后）跑起来后，手机 logcat：
+
+```
+wpa_supplicant: P2P-DEVICE-FOUND 4a:d5:77:f0:2f:01 p2p_dev_addr=4e:d5:77:f0:2f:01
+    pri_dev_type=10-0050F204-5 name='LinuxBox' config_methods=0x188
+wpa_supplicant: p2p0: Trying to associate with SSID 'DIRECT-aa-fastCon'
+wpa_supplicant: p2p0: Associated with 4a:d5:77:f0:2f:01
+wpa_supplicant: p2p0: WPA: RX message 1 of 4-Way Handshake
+wpa_supplicant: p2p0: WPA: Key negotiation completed [PTK=CCMP GTK=CCMP]
+wpa_supplicant: P2P-GROUP-STARTED p2p0 client ssid="DIRECT-aa-fastCon"
+    freq=2437 go_dev_addr=4e:d5:77:f0:2f:01 [PERSISTENT]
+```
+
+**关联、四次握手、密钥协商全部成功**——PSK `12345678` 被正确使用，
+说明我们推的 JSON 里的 ssid/psk 确实生效了（`type=42` 走 `F(freq)` 那条也带了
+`setNetworkName/Passphrase`，之前担心的分支问题不存在）。
+
+## 卡在 DHCP
+
+```
+DhcpClient: Broadcasting DHCPDISCOVER     (15:55:55, 重复 6 次)
+IpClient/p2p0: addressUpdated: fe80::cc46:31ff:fefb:e288/64   (只拿到 IPv6 link-local)
+OplusP2pDhcpMonitor: dhcp monitor 18s timeout..
+```
+
+笔记本侧 `dnsmasq` 日志只有启动信息，**没有任何 DHCPDISCOVER 记录**：
+
+```
+dnsmasq-dhcp: DHCP, IP range 192.168.49.10 -- 192.168.49.200, lease time 12h
+dnsmasq-dhcp: DHCP, sockets bound exclusively to interface p2p-wlan0-0
+（之后无输出，--log-dhcp 也没记到包）
+```
+
+但接口上确实有流量（`RX 3420 bytes / 18 packets`，`TX 14382 / 84`），
+说明手机在发、我们在回（或至少 ARP/组播在动）。
+
+**最可能的原因：本机防火墙（nftables/iptables）默认 DROP 了 `p2p-wlan0-0` 的
+UDP 67/68。** 我这边的 `nft`/`iptables` 需要 root 才能查，所以做了个诊断脚本：
+
+```sh
+sudo /tmp/p2p_diag.sh
+```
+
+它会打印 nftables 规则 + iptables INPUT 链，并抓 10 个 DHCP 包
+（跑的时候在手机上再点一次 LinuxBox）。
+
+## 如果确认是防火墙
+
+按顺序加（nft）：
+
+```sh
+nft add rule inet filter input iifname "p2p-wlan0-*" accept
+nft add rule inet filter output oifname "p2p-wlan0-*" accept
+```
+
+或者更彻底地，在 `p2p_go.sh` 里加一段（需要 root，脚本本来就是 root）：
+
+```sh
+nft add table inet oshare 2>/dev/null
+nft 'add chain inet oshare input { type filter hook input priority -10; }' 2>/dev/null
+nft add rule inet oshare input iifname "p2p-wlan0-*" accept 2>/dev/null
+nft add rule inet oshare input iifname "p2p-wlan0-*" counter accept 2>/dev/null
+```
+
+我可以直接写进脚本，但需要你先确认 `nft list ruleset` 里到底有没有全局 drop。
+
+## 另一个可能：`p2p-wlan0-0` 的 IPv4 地址在 dnsmasq 启动后才加
+
+脚本里顺序是 **先 `ip addr add` 再起 dnsmasq**，所以应该是好的。
+但 dnsmasq 报的是 `sockets bound exclusively to interface`（`--bind-dynamic` 的输出），
+如果它绑定时刻接口还没 `UP`（`ip link set up` 在 `ip addr add` 之后），
+socket 可能绑到了错误的地址。诊断脚本的抓包里如果能看到 `DHCPDISCOVER` 但
+dnsmasq 没回，那就是这个原因，我把 `ip link set up` 提到最前面。
+
+## 需要你跑的一步
+
+```sh
+sudo /tmp/p2p_diag.sh
+```
+
+（脚本会等 25 秒抓包，期间请**在手机上重新点一次 LinuxBox**，
+并保持 `p2p_go.sh` 那个终端还开着。）
