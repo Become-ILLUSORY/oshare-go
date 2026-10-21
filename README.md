@@ -80,6 +80,22 @@ res, err := transfer.Receive(ctx, sess, transfer.ReceiveOptions{
 })
 ```
 
+## BLE experiment (OTG: make the phone see a Linux peer)
+
+The 互传 flow discovers peers over BLE, exchanges the Wi-Fi Direct credentials
+there, and only then transfers over TLS. `tools/` contains the BlueZ side:
+
+```sh
+sudo pacman -S bluez bluez-utils python-dbus python-gobject   # CachyOS
+sudo systemctl enable --now bluetooth
+
+sudo python3 tools/oshare_ble.py scan -t 20     # dump nearby adverts
+sudo python3 tools/oshare_ble.py serve          # advertise + GATT server
+```
+
+Details of the advertisement payload, the capability bits and the GATT
+services/characteristics are in [docs/BLE.md](docs/BLE.md).
+
 ## Compatibility notes
 
 * File transfer between two hosts running this library works out of the box
