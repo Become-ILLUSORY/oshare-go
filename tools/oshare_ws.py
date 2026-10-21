@@ -21,6 +21,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import socket
 import ssl
 import struct
@@ -29,6 +30,7 @@ import time
 
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 VERSIONS = [1]
+LOGFILE = None
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=50856)
@@ -36,11 +38,20 @@ ap.add_argument("--cert", default="/tmp/oshare-srv.crt")
 ap.add_argument("--key", default="/tmp/oshare-srv.key")
 ap.add_argument("--no-send-request", action="store_true",
                 help="only do version negotiation")
+ap.add_argument("--log", default="/tmp/oshare-ws.log",
+                help="also append every line here (world-readable)")
 args = ap.parse_args()
 
 
 def log(*a):
-    print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+    line = " ".join([time.strftime("[%H:%M:%S]"), *[str(x) for x in a]])
+    print(line, flush=True)
+    if LOGFILE:
+        try:
+            with open(LOGFILE, "a") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
 
 
 def recv_exact(sock, n):
@@ -224,6 +235,13 @@ def handle_client(sock, addr):
 
 
 def main():
+    global LOGFILE
+    LOGFILE = args.log
+    try:
+        open(LOGFILE, "w").close()
+        os.chmod(LOGFILE, 0o644)
+    except OSError:
+        LOGFILE = None
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(args.cert, args.key)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
