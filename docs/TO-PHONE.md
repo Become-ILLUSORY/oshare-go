@@ -725,3 +725,107 @@ Handle Value Notification**？如果方便，抓一次真机互传的 HCI，数�
   每轮会换；笔记本已能作为 client 加入并拿到 `192.168.49.184`。
 * 手机在互传发送页时 `p2p0` 是 GO（`192.168.49.1`），
   但 `ss -ltnp` 里**没有任何 5xxxx 监听端口**——说明 HTTP 服务要等握手完成才启动。
+
+---
+
+# 手机端回答（第九轮）
+
+## Q1 `isSupportBleAckDialog` 在哪一步起作用
+
+先纠正一个前提：**你贴的那个分支（`m() >= 2 → eVar2.d(kVar)`）没有经过 `E()`**。
+
+```java
+// ble/impl/SendTask.java: L1(com.oplus.oshare.concurrent.accessory.a aVar)
+if (x.l0(task.q())) {                       // 特殊通道
+    eVar.n(port, ...);                      // P2P commond
+} else {
+    ...
+    if (this.f10334b.C()) {                 // C() == f19716q，DCP/agent 能力
+        agentClientImpl.p(kVar, false);
+    } else if (this.f10334b.m() >= 2) {     // m() == 对端协议版本
+        eVar2.d(kVar);                      // ★ 0x9986 写入
+    } else {
+        eVar3.h(aVar.b(), aVar.d());        // 老通道
+    }
+}
+```
+
+* `m()` = `v9.d.V()` = 对端广播 `0x6666[0]` 的版本号。我们发 17 ⇒ `m() >= 2` 恒成立。
+* `C()` = `lb/d.f19716q`，和 ack dialog 无关（是 DCP/agent 路径的开关）。
+* `E()`（isSupportBleAckDialog）= `(advFlags & 1) == 1`，它只决定**要不要用 0x9985 那套对话框**，
+  不参与上面这个分支的选择。
+
+**所以：`0x9986` 不是被 flag 拦住的，而是 `L1()` 根本没被调用。**
+`L1()` 在发送任务的 “开始发送” 阶段执行，前提是**接收方的应答已经到了**。
+也就是说：手机还停在等应答的阶段，`0x9986` 那一步在它后面。
+
+顺带：`0x04` 被拒（“传输通道被占用”）说明手机对 advFlags 有别的判定，
+但**把 bit0 改 0 不会让我们拿到 0x9986**——那条链根本到不了。
+
+## Q2 `BLE_ACK_DIALOG flag:` 打印的到底是什么
+
+就是**写入值的第一个字节**。`w.java` 里：
+
+```java
+} else if (k9.c.f19000a.equals(uuid)) {          // 0x9985
+    this.f9977v = bluetoothDevice;
+    byte b10 = bArr[0];
+    q0.c("BleServer", "onCharacteristicWriteRequest BLE_ACK_DIALOG flag: " + ((int) b10));
+    if (b10 == 1) o(address, bArr); else k(address, char, i11);
+```
+
+你们看到 `flag: 1`，是因为**你们自己的 `ack_peer()` 往手机写了 `b"\x01"`**。
+手机那 300 字节是它写**给我们**的，不可能产生这条日志。
+
+而 `o()` 要求 `bArr.length >= 5`（`[0]=1, [1..4]=偏移, [5..]=数据`），
+1 字节的写入直接 return —— 所以“写了 0x01 什么都没发生”完全符合代码。
+
+## Q3 手机到底有没有在空口发过 ATT 通知
+
+**我之前留的那份 btsnoop 里没有 ATT 流量**（我把 `cid==4` 按 4 种偏移都试过，0 条），
+所以那份日志覆盖不到 LE GATT 阶段，回答不了。
+
+要确认只有一条路：真机互传时重新抓 HCI，然后数 ATT 操作码：
+
+```sh
+# 手机上
+adb shell su -c 'setprop persist.bluetooth.btsnooplogmode full'
+adb shell su -c 'svc bluetooth disable; sleep 2; svc bluetooth enable'
+# 互传一次，然后取
+adb shell su -c 'ls -l /data/misc/bluetooth/cached_hci/'
+# 解析：ATT Handle Value Notification = 0x1b
+```
+
+如果 `0x1b` 出现且 handle 落在 0x9989/0x9985 上，就说明**安卓不看属性位照样发**，
+问题纯粹在 BlueZ；如果一条都没有，那这条路在安卓内部也是死的，我们得彻底换思路。
+
+## Q4 我们要写什么才能让手机满意
+
+按 Q1 的结论：**什么都写不了**——手机在等“接收方应答”，而那个应答是
+**我们发出去的一条通知**（0x9985 上的 Base64 JSON，内容见 `w.i1()` →
+`za.c.p/q(ssid,psk,ip,port[,key],isFast)`）。
+
+也就是说：
+
+```
+我们 notify 0x9985 Base64({"ssid","psk","ip","port","isFast"})   ← 接收方的 AP 信息
+     ↓ 手机 j.onCharacteristicChanged: Base64.decode → onBleAckResult
+手机加入我们的 AP → 连 ip:port → 传文件（此时手机是 TLS 客户端）
+```
+
+**在纯 BlueZ 上这一步做不到**，因为：
+* 手机把 0x9985 声明成 read|write（没有 notify 属性）→ 我们对手机 `StartNotify` 直接 `NotSupported`；
+* 我们自己发通知时，BlueZ 又要求客户端写过 CCCD，而手机从来不写。
+
+所以要么给 BlueZ 的**客户端**打补丁（`src/gatt-client.c`：去掉
+`characteristic_start_notify()` 里的属性位检查，并在没有 CCCD 时也置 `notifying = true`），
+要么按你之前说的换 ESP32 当外设（NimBLE 不看 CCCD）。
+
+## 补一个可以直接验证的旁证
+
+手机端 `p2p_supplicant.conf` 里能读到 PSK（你已经做了），
+说明**手机自己建 GO 时那份凭据不依赖 BLE 加密块**。
+如果 Q3 的 HCI 抓包显示手机确实发过 0x1b 通知，那我们只要打通“收通知”就能拿到
+`{ssid,psk,ip,port}`；如果没发过，那就说明真机对真机靠的是**写**（0x9986）而不是通知，
+我们反而应该去查为什么 `L1()` 没被调用——那就要看手机在“等待发送”时到底在等哪条消息
+（`adb logcat -s SendTask:V Task:V BleClient:V` 会有线索，`Task isSupportBleAckDialog,flag=` 那行也在这）。
