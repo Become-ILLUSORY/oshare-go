@@ -1,25 +1,22 @@
 #!/usr/bin/env python3
-"""Minimal OShare HTTPS + WebSocket endpoint, mirroring what the phone expects.
+"""Serve the OShare receive flow with a real ZIP so the phone can finish.
 
-Ports and channels come from the captures (docs/TO-PHONE.md, HANDOFF §5):
+Sequence (fa/p.java as server, ib/b.java as client, eb/d.java for the schema):
 
-    wss://<us>:<port>/websocket     text frames "<flow>:<code>:<name>?<json>"
-                                    flow ∈ ack | action
-    GET    <us>:<port>/download     chunked data stream (served here as a stub)
+    action:0:versionNegotiation?{"versions":[1]}
+    ack:0:versionNegotiation?{"version":1}
+    action:0:sendRequest?{id,senderId,senderName,fileName,mimeType,fileCount,
+                          version,totalSize,thumbnail*,wlan}
+    -> the phone pops its accept dialog and answers ack:0:sendRequest
+    GET /download?taskId=<id>  ->  chunked application/zip
+    action:0:status?{"taskId":<id>,"type":1}      (1 = ok; never 2 mid-flight)
 
-Sequence, from fa/p.java (HttpWlanServer) and ib/b.java (HttpP2pClient):
-
-    server -> action:0:versionNegotiation?{"versions":[1]}     (500 ms after connect)
-    client -> ack:0:versionNegotiation?{"version":1}
-    server -> action:0:sendRequest?{id,senderId,senderName,fileName,mimeType,
-                                    fileCount,totalSize,wlan}
-
-Every frame is logged verbatim so the next step can be read off the phone's
-replies instead of guessed.
+usage: oshare_ws.py --port 50856 [--file PATH] [--delay 1.5]
 """
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import socket
@@ -27,6 +24,7 @@ import ssl
 import struct
 import threading
 import time
+import zipfile
 
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 VERSIONS = [1]
@@ -36,14 +34,15 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=50856)
 ap.add_argument("--cert", default="/tmp/oshare-srv.crt")
 ap.add_argument("--key", default="/tmp/oshare-srv.key")
-ap.add_argument("--no-send-request", action="store_true",
-                help="only do version negotiation")
 ap.add_argument("--delay", type=float, default=1.5,
-                help="seconds to wait after the upgrade before announcing versions")
-ap.add_argument("--stall-download", action="store_true",
-                help="accept /download but never answer, to see who times out")
+                help="seconds between the upgrade and versionNegotiation")
+ap.add_argument("--file", default=None,
+                help="file to serve; defaults to a small generated one")
+ap.add_argument("--task-id", default="0001")
 ap.add_argument("--log", default="/tmp/oshare-ws.log",
                 help="also append every line here (world-readable)")
+ap.add_argument("--stall-download", action="store_true",
+                help="log /download and never answer, to see who times out")
 args = ap.parse_args()
 
 
@@ -113,7 +112,6 @@ def read_frame(sock):
 
 
 def parse_msg(text):
-    """flow:code:name?json -> dict, or None."""
     head, sep, body = text.partition("?")
     parts = head.split(":")
     if len(parts) < 3:
@@ -125,6 +123,30 @@ def parse_msg(text):
         except json.JSONDecodeError:
             msg["raw"] = body
     return msg
+
+
+def build_payload():
+    """File to send plus the sendRequest fields describing it.
+
+    The bytes here are the *content*; zip_stream() wraps them in the zip the
+    phone expects on /download, so a --file is sent as-is inside one entry.
+    """
+    if args.file:
+        with open(args.file, "rb") as fh:
+            data = fh.read()
+        name = os.path.basename(args.file)
+    else:
+        data = ("hello from oshare-go\n" * 8).encode()
+        name = "oshare-hello.txt"
+    return data, name
+
+
+def zip_stream(data, name):
+    """Zip the payload the way ea/a.java does: a single entry, streamed."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(name, data)
+    return buf.getvalue()
 
 
 class Chan:
@@ -141,29 +163,10 @@ class Chan:
         log(f"[ws] -> {text}")
 
 
-def send_request_payload():
-    """eb/d.java a(boolean): what HttpWlanServer announces before serving."""
-    return {
-        "id": "0001",
-        "senderId": "0123456789abcdef",
-        "senderName": "LinuxBox",
-        "fileName": "oshare-test.bin",
-        "mimeType": "application/octet-stream",
-        "fileCount": 1,
-        "totalSize": 16,
-        "thumbnail": "",
-        "thumbnail_height": 0,
-        "thumbnail_width": 0,
-        "wlan": True,
-    }
-
-
-def handle_ws(sock):
+def handle_ws(sock, send_req):
     ch = Chan(sock)
-    # fa/p.java sends the first action half a second after the upgrade, giving
-    # the client's channel a moment to become active.
-    threading.Timer(args.delay, lambda: ch.send("action", "versionNegotiation",
-                                         payload={"versions": VERSIONS})).start()
+    threading.Timer(args.delay, lambda: ch.send(
+        "action", "versionNegotiation", payload={"versions": VERSIONS})).start()
     try:
         while True:
             op, payload = read_frame(sock)
@@ -181,26 +184,50 @@ def handle_ws(sock):
             msg = parse_msg(text)
             if not msg:
                 continue
-            if msg["flow"] == "ack" and msg["name"] == "versionNegotiation":
+            name, flow = msg["name"], msg["flow"]
+            if flow == "ack" and name == "versionNegotiation":
                 ver = (msg.get("json") or {}).get("version", VERSIONS[0])
                 log(f"[ws]    negotiated version {ver}")
-                if not args.no_send_request:
-                    ch.send("action", "sendRequest", payload=send_request_payload())
-            elif msg["flow"] == "ack" and msg["name"] == "sendRequest":
-                log("[ws]    peer accepted the transfer request")
-            elif msg["flow"] == "action":
-                log(f"[ws]    peer action {msg['name']} (not handled yet)")
+                ch.send("action", "sendRequest", payload=send_req)
+            elif flow == "ack" and name == "sendRequest":
+                log("[ws]    phone accepted the transfer request"
+                    " (it should now GET /download)")
+            elif flow == "action" and name == "status":
+                log(f"[ws]    peer status {msg.get('json')}")
+            else:
+                log(f"[ws]    unhandled {flow}:{name}")
     except (ConnectionError, OSError) as e:
         log("[ws] closed:", e)
 
 
-def handle_client(sock, addr):
+def serve_download(sock, path, data, name):
+    body = zip_stream(data, name)
+    log(f"[http] /download -> {len(body)}B zip, 1 entry")
+    head = (
+        "HTTP/1.1 200 OK\r\n"
+        "Server: VS-HTTP\r\n"
+        "Content-Type: application/zip\r\n"
+        "Content-Disposition: attachment; filename=\"files.zip\"\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode()
+    sock.sendall(head)
+    # Chunked: 8 KiB pieces, then the terminating zero chunk.
+    for i in range(0, len(body), 8192):
+        piece = body[i:i + 8192]
+        sock.sendall(f"{len(piece):x}\r\n".encode() + piece + b"\r\n")
+    sock.sendall(b"0\r\n\r\n")
+    log(f"[http] sent {len(body)}B for {path}")
+
+
+def handle_client(sock, addr, send_req, data, name):
     peer = f"{addr[0]}:{addr[1]}"
     log(f"[tls] connection from {peer}")
     try:
         method, path, headers, _rest = read_http_head(sock)
         log(f"[http] {method} {path}")
-        for k in ("host", "upgrade", "sec-websocket-key", "user-agent"):
+        for k in ("host", "upgrade", "sec-websocket-key", "user-agent",
+                  "transfer-encoding", "range"):
             if k in headers:
                 log(f"[http]   {k}: {headers[k]}")
 
@@ -211,23 +238,15 @@ def handle_client(sock, addr):
                          b"Upgrade: websocket\r\n"
                          b"Connection: Upgrade\r\n"
                          b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n")
-            handle_ws(sock)
+            handle_ws(sock, send_req)
             return
 
         if path.startswith("/download"):
-            log("[http] download request headers:")
-            for k, v in headers.items():
-                log(f"[http]   {k}: {v}")
             if args.stall_download:
-                log("[http] stalling (--stall-download), peer must time out")
+                log("[http] stalling (--stall-download)")
                 time.sleep(120)
                 return
-            body = bytes(range(16))
-            sock.sendall(b"HTTP/1.1 200 OK\r\n"
-                         b"Content-Type: application/octet-stream\r\n"
-                         b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-                         b"Connection: close\r\n\r\n" + body)
-            log(f"[http] served {len(body)} bytes for {path}")
+            serve_download(sock, path, data, name)
             return
 
         body = b'{"result":0}'
@@ -253,6 +272,24 @@ def main():
         os.chmod(LOGFILE, 0o644)
     except OSError:
         LOGFILE = None
+
+    data, name = build_payload()
+    send_req = {
+        "id": args.task_id,
+        "senderId": "0123456789abcdef",
+        "senderName": "LinuxBox",
+        "fileName": name,
+        "mimeType": "file/*",
+        "fileCount": 1,
+        "version": str(VERSIONS[0]),
+        "totalSize": len(data),
+        "thumbnail": "",
+        "thumbnail_height": 0,
+        "thumbnail_width": 0,
+        "wlan": True,
+    }
+    log(f"payload: {name} ({len(data)}B)")
+
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(args.cert, args.key)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -268,7 +305,9 @@ def main():
             log(f"[tls] handshake failed from {addr}: {e}")
             raw.close()
             continue
-        threading.Thread(target=handle_client, args=(tls, addr), daemon=True).start()
+        threading.Thread(target=handle_client,
+                         args=(tls, addr, send_req, data, name),
+                         daemon=True).start()
 
 
 main()
