@@ -1196,3 +1196,102 @@ if (TextUtils.isEmpty(aVar.f23796g /*ssid*/) || TextUtils.isEmpty(aVar.f23797h /
 需要你确认：**这本子的 `wlan0` 能不能同时跑 hostapd**（有些网卡驱动不支持 AP+STA 并发，
 但我们是 AP-only，应该没问题）。要我先试 `iw list | grep -A5 "Supported interface modes"`
 看看有没有 `AP`？
+
+---
+
+# 第十二轮：`0x9953` 全链路跑通了，卡在「我们是普通 AP，手机找的是 P2P GO」
+
+## 实测（带真实 ssid/psk）
+
+```sh
+$ python3 tools/push_json.py --match 真我 --port 50856 \
+      --ssid "DIRECT-aa-fastCon" --psk "12345678" --freq 2437 --mac 4cd577f02f01
+[15:42:08] write accepted
+```
+
+手机侧（同秒）：
+
+```
+OShare_BleServer: onCharacteristicWriteRequest: common share ok
+OShare_OShareServer: write data: port = 50856, frequency = 2437
+OShare_HttpP2pClient: connectToServer: ... frequency = 2437 transfer version = 0
+OShare_WifiP2PManager: connectToDevice!
+OShare_WifiP2PManager: connectToDevice frequency:2437 add:4c:d5:77:f0:2f:01   ← ★ 拨我们的 mac
+OShare_WifiP2PManager: fastDiscoverPeers mHostDevice.mSendVender: 42
+OShare_WifiP2PManager: discoverPeersOnSpecificFrequency: frequency = 2437
+OShare_WifiP2PManager: fastDiscoverPeers: onSuccess           （每 1s 重试）
+```
+
+也就是**它确实拿着我们给的 mac/ssid/psk 去连了**，`type=42`（`ssid` 以 `fastCon` 结尾时
+`za.c.z()` 的返回值）也和我们推的一致，`x.g0(42)=false` 合法。
+
+## 但它是 `P2P` 发现，不是普通 AP 扫描
+
+我起了一个普通 hostapd AP（`nmcli ... 802-11-wireless.mode ap`，
+SSID/PSK 与 JSON 相同，`10.42.0.1/24`），手机**看不见**：
+
+* `OShare_WifiP2PManager: discoverPeersOnSpecificFrequency: frequency = 2437` —— 这是
+  `WifiP2pManager.discoverPeers`，只收 **P2P 帧**（`P2P_DEVICE` / `P2P_GO` 的
+  action frame），普通 AP 的 beacon 它不当候选；
+* 手机 `p2p0` 一直是 `type managed`，`groupFormed: false`，最后
+  `WPA_CTRL-EVENT-DISCONNECTED reason=3 locally_generated`（它自己放弃）。
+
+**所以我们需要自己的 `P2P GO`**，不是 hostapd AP。`iw list` 里 `wlan0` 支持
+`P2P-GO`，`nmcli` 也已经建好了 `p2p-dev-wlan0`（type `wifi-p2p`），
+但 NetworkManager 1.58 没有「创建 P2P GO 并把 SSID/PSK 写死」的命令，
+所以只能直接驱动 `wpa_supplicant`。
+
+## 我写了 `tools/p2p_go.sh`
+
+流程：
+
+```sh
+sudo ./tools/p2p_go.sh "DIRECT-aa-fastCon" "12345678" 50856
+```
+
+1. `nmcli device set wlan0 managed no`（把网卡从 NM 手里拿回来）
+2. 用私有配置起 `wpa_supplicant`（`ctrl_interface=/run/oshare-p2p`，
+   `device_type=10-0050F204-5`，`p2p_no_group_iface=0`）
+3. `add_network` → `ssid`/`psk`/`mode=3`/`disabled=2`，然后
+   `p2p_group_add persistent=<netid> freq=2437`
+   —— 这一步会建出一个 **P2P GO**，SSID/PSK 就是我们给的那组，
+   和手机 `createGroup` 时用的 `setNetworkName("DIRECT-aa-fastCon").setPassphrase(...)
+   .enablePersistentMode(true)` 完全对称
+4. 在 `p2p-wlan0-0` 上起 TLS 服务（自签 `CN=localhost`），端口 = JSON 里的 port
+
+需要你做的只有一件事：**sudo 跑它**（我这边 `sudo -n` 不行，需要密码）。
+跑起来之后，我这边再执行一次 `push_json.py`，手机就应该能 P2P 连上我们、
+拿到 `192.168.49.x` 地址、并按 `port` 打我们的 TLS。
+
+## 副作用 / 恢复
+
+* 脚本把 `wlan0` 从 NetworkManager 拿走后，普通 Wi-Fi 会断——但
+  **USB 共享网络（`enp98s0f4u2`）仍然是默认路由**，所以你的网不会断（已验证）。
+* `Ctrl-C` 退出时会 `p2p_group_remove`、杀掉私有 `wpa_supplicant`、
+  `nmcli device set wlan0 managed yes`，把网卡还给 NM。
+
+## 一个还需要确认的点
+
+`u9.n.fastConnectPeers` 里判断是否走 fastCon 直连的条件是
+
+```java
+if (TextUtils.isEmpty(ssid) || TextUtils.isEmpty(psk) || type >= 20 || WifiUtils.l()) {
+    cfg = F(freq);              // 或者 new WifiP2pConfig().deviceAddress = mac
+} else {
+    cfg.setNetworkName(ssid).setPassphrase(psk).build();
+    cfg.deviceAddress = mac;
+}
+```
+
+我们给的 `type=42 >= 20`，所以它**不会**走 `setNetworkName/setPassphrase` 分支，
+而是走 `F(freq)` / 裸 `deviceAddress` —— 也就是**只按 mac 做普通 P2P 协商**，
+SSID/PSK 由协商结果决定。
+
+这意味着：**我们给的 ssid/psk 其实不会被用来建组**，
+手机只是按 mac 找到我们的 P2P 设备然后协商。那我们这边的 GO 用哪个 SSID
+都可以，关键是**必须能被 `discoverPeers` 发现**（P2P GO），
+并且协商时接受手机的加入请求。
+
+请确认这一点——如果是对的，`p2p_go.sh` 里 SSID 随便填，PSK 也无关紧要；
+如果 `type` 需要 < 20 才会用我们的 ssid/psk，那 `z()` 的算法
+（`ssid.endsWith("fastCon") ? 42 : ...`）要改，我们就不再让 ssid 以 fastCon 结尾。
