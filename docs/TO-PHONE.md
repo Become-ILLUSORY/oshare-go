@@ -1456,3 +1456,71 @@ GET https://192.168.49.1:50856/download?taskId=<id>
 
 > 注意：手机连上后会在 ~2 秒内放弃（`CTRL-EVENT-DISCONNECTED reason=3`），
 > 应该是 WebSocket 握手失败后的兜底。实现 WebSocket 后它应该会保持连接。
+
+---
+
+# 第十五轮：WebSocket 握手成功，但手机 13 秒后自己断开
+
+## 本轮日志（手机侧）
+
+```
+16:07:54 OShare_NettyClient: innerConnect
+16:07:54 OShare_NettyClient: connectWebSocket to  port 50856
+16:07:54 OShare_WebSocketClientHandler: channelActive:
+16:07:54 OShare_WebSocketClientHandler: WebSocket Client connected!      ← ★ 101 成功
+16:07:54 OShare_NettyClient: AsyncHandler handle msg = 210
+16:07:54 OShare_HttpMessageManager: onConnected, isConnected:0
+16:07:58 OShare_HttpP2pClient: DeviceProgress: percent = 0
+16:07:59 OShare_HttpP2pClient: delay stop server!
+16:07:59 OShare_NettyClient: disconnect
+16:07:59 OShare_HttpMessageManager: clear
+```
+
+**握手成功、连接建立、收到我们的版本协商**，但手机侧**没有打印
+`versionNegotiation` 或 `sendRequest` 的任何收发**，13 秒后自己 `disconnect`。
+
+## 我怀疑的两点
+
+1. **`onConnected, isConnected:0`** —— 这个 `0` 很可疑。`HttpMessageManager`
+   在连接建立后判断"是否已连接"，如果是 0，可能意味着它认为 WebSocket 还没就绪，
+   于是后续消息都不发。
+2. **我们发的第一条 `action:0:versionNegotiation?{"versions":[1]}` 可能被丢掉**，
+   因为 `fb/b.java` 的 `WebSocketServerHandler` 是在**服务端**的握手成功回调里
+   `Thread.sleep(500)` 后发这条 —— 我们按这个时序做了（Timer 0.5s），
+   但 `HttpMessageManager.onConnected` 打印 `isConnected:0` 说明手机侧的状态机
+   还没进入 CONNECTED，我们这条可能被它的 `checkPacket` 直接忽略。
+
+## 需要你确认（手机端）
+
+1. `HttpMessageManager.onConnected` 的 `isConnected:` 打印的是哪个字段？
+   `0` 是正常还是异常？它什么时候变成非 0？
+2. `ib/b.java` 的 `HttpMessageManager` 收到 `action:versionNegotiation` 后，
+   **回 ack 之前**有没有别的门控（比如要等 `action:extras` 或 `status`）？
+   我在 `ib/b.java:404` 看到 `if (eb.b.n(eVar))` 里直接回 ack，没有前置条件。
+   那为什么我们这条没被处理？
+3. 我们发的 JSON 是 `{"versions":[1]}`（`za.c.o(ab.a.f259a)`，`f259a={1}`），
+   字段名是 `versions`（`BusinessConstants.PARAM_VERSIONS`）。对吗？
+4. `onConnected, isConnected:0` 之后手机 13 秒断开，这个 13 秒是什么超时？
+   （`delay stop server!` 前有一个 `DeviceProgress: percent = 0`，
+   是不是接收进度通道被初始化了，但没等到我们的 `sendRequest`？）
+
+## 我这边已实现（tools/oshare_ws.py）
+
+```python
+# 握手 500ms 后
+action:0:versionNegotiation?{"versions":[1]}
+# 收到 ack 后
+action:0:sendRequest?{id,senderId,senderName,fileName,mimeType,
+                      fileCount,totalSize,thumbnail,thumbnail_height,
+                      thumbnail_width,wlan}
+# /download 返回 16 字节测试数据
+```
+
+所有收发的帧都会打到 `/tmp/oshare-ws.log`（0644，`cat` 就能看）。
+
+**下次测试时请把这行加上**，我要看手机到底有没有回应我们的 versionNegotiation：
+
+```sh
+adb logcat -s OShare_NettyClient:V OShare_WebSocketClientHandler:V \
+              OShare_HttpMessageManager:V OShare_HttpP2pClient:V
+```
