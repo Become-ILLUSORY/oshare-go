@@ -1734,3 +1734,74 @@ writeAndFlush(new HttpChunkedInput(new ea.a(...)));   // ea.a = ChunkedZipOutput
 
 如果第 3 步的 `GET /download` 一直不来，那就是手机还在等用户操作（或者弹框被别的界面压掉了），
 可以把 `ReceiveCommonDialogActivity` 拉到前台看：`adb shell dumpsys activity activities | grep -i receive`。
+
+---
+
+# 第十七轮：**文件传输全链路成功！**
+
+## 服务端日志（`tools/oshare_ws.py`，`/tmp/oshare-ws.log`）
+
+```
+[16:19:57] [tls] connection from 192.168.49.184:54258
+[16:19:57] [http] GET /websocket
+[16:19:57] [http]   upgrade: websocket
+[16:19:58] [ws] -> action:0:versionNegotiation?{"versions":[1]}
+[16:19:59] [ws] <- ack:0:versionNegotiation?{"version":1}
+[16:19:59] [ws]    negotiated version 1
+[16:19:59] [ws] -> action:0:sendRequest?{"id":"0001","senderId":"0123456789abcdef",
+                     "senderName":"LinuxBox","fileName":"oshare-hello.txt",
+                     "mimeType":"file/*","fileCount":1,"version":"1","totalSize":168,
+                     "thumbnail":"","thumbnail_height":0,"thumbnail_width":0,"wlan":true}
+[16:19:59] [ws] <- ack:0:sendRequest
+[16:20:01] [tls] connection from 192.168.49.184:54262
+[16:20:01] [http] GET /download?taskId=0001
+[16:20:01] [http]   user-agent: okhttp/4.12.0
+[16:20:01] [http] /download -> 156B zip, 1 entry
+[16:20:01] [http] sent 156B for /download?taskId=0001
+[16:20:01] [ws] <- action:0:status?{"taskId":"0001","type":1}
+[16:20:03] [ws] closed: peer closed
+```
+
+**手机完整走完了**：
+
+1. WebSocket 握手（101）
+2. 收我们的 `versionNegotiation`，回 `ack`（`version:1`）
+3. 收我们的 `sendRequest`（字段全部被 `eb/d.java` 解析成功，没报 "no enough space"）
+4. **回 `ack:0:sendRequest`** —— 说明接收框自动接受了（我们的 `totalSize=168` 很小）
+5. **主动 `GET /download?taskId=0001`**（okhttp/4.12.0，第二条 TLS 连接）
+6. 收下 156 字节的 chunked ZIP
+7. **主动发 `action:0:status?{"taskId":"0001","type":1}`** —— `type=1` 表示成功
+8. 正常关闭
+
+这一步是整个项目的第一条**完整端到端传输**：
+
+```
+BLE 发现 → GATT 0x9996/0x9954/0x9953 → P2P GO(关联+握手+DHCP) →
+wss:// websocket 控制通道 → GET /download (chunked zip) → status:1
+```
+
+## 但文件没有落到 /sdcard
+
+手机侧 `find /sdcard -newermt -10min` 什么都没找到，
+`/sdcard/Download/realme Share/` 里也没有新文件。
+
+可能原因：
+
+1. 我们 zip 里的条目名是 `oshare-hello.txt`，手机可能要求**目录结构**或者
+   对 `file/*` 有特定的落盘路径；
+2. 手机先写临时文件再 rename，但 `status:1` 之后马上被清理（下载完成回调里
+   `gb.a.d().g(taskId)` 记的是 URL，实际解压可能在 `z9/*` 的服务端侧就完成了——
+   我们是自己造的 zip，手机只是把它当"流"存下来再解压）；
+3. 文件确实写到了别处（比如 `/sdcard/Android/data/com.coloros.oshare/cache/`）。
+
+下一步我这边做：
+
+* 用 `adb shell su -c 'find / -newermt "-20 minutes" -name "*oshare*" 2>/dev/null'`
+  全盘找一下；
+* 把 zip 条目名改成中文/带目录的形式再试一次；
+* 同时看手机 logcat 的 `onReceiveFile`（`ib/b.java:203`）有没有打印——
+  这次日志里只有一条无关的 `DMP-PersonalizationProvider`，说明**手机的接收回调根本没触发**。
+
+`status:1` 是手机自己发的，说明它认为"下载完成"，但解压/落盘那一步没走通。
+需要你确认 `z9/a.java` 里服务端是否应该**按文件逐个 zip 条目**而不是一个大 zip，
+以及 `ra/b.java` 的 `fileId` 参数在单文件时是否需要带上。
