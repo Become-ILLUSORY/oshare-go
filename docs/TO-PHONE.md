@@ -1952,3 +1952,54 @@ done: 1 file(s)
 
 `p2p_join.sh` 会把 `wlan0` 从 NetworkManager 拿走并停掉 TUN 代理，
 你的普通上网会短暂中断（USB 共享网络还在的话不影响）。`Ctrl-C` 会恢复。
+
+---
+
+# 第二十轮：一键流程（`tools/oshare-go.sh`）
+
+目标：像手机对手机那样，**手机上选文件 → 点一下设备 → 传完**，中间不用再敲命令。
+
+## 用法
+
+```sh
+sudo ./tools/oshare-go.sh                       # 发一个默认小文件
+sudo ./tools/oshare-go.sh -f ~/movie.mp4        # 发真实文件
+sudo ./tools/oshare-go.sh -f ~/a.zip -n NAS     # 自定义 BLE 设备名
+```
+
+它会自己做完全部七件事：
+
+1. 从 NetworkManager 手里接管 `wlan0`；
+2. 起私有 `wpa_supplicant`，建 **P2P GO**（SSID `DIRECT-aa-fastCon`，
+   PSK 随机 8 位数字，`freq=2437`）；
+3. `192.168.49.1/24` + `dnsmasq` DHCP + `iptables` 放行；
+4. 找一个空闲端口，起 `oshare_ws.py` 提供 `wss://…/websocket` 与 `/download`；
+5. 起 `oshare_ble.py serve` 广播 + GATT 服务；
+6. **手机写来分享请求时自动反连**：读 `0x9954`、写 `0x9953`
+   （把上面选好的 port/SSID/PSK 推给手机）；
+7. 等手机连进 P2P 组、WebSocket 协商、拉 `/download`，传完自动收摊。
+
+`Ctrl-C` 会恢复 Wi-Fi 与代理。
+
+## 关键改动（`tools/oshare_ble.py`）
+
+新增 `--share-port/--share-ssid/--share-psk/--share-freq`：
+一旦手机往 `0x9985` 写了分享请求，`oshare_ble.py` 会
+
+```python
+ack_peer(...)                 # 先回一个 0x01（手机端无副作用，保留）
+push_common_share(...)        # 1.5s 后：Connect 手机 → Read 0x9954 → Write 0x9953
+```
+
+也就是说**原来手敲的 `python3 tools/push_json.py …` 那一步被合并进来了**。
+
+## 还需要你验证的
+
+1. `sudo ./tools/oshare-go.sh -f <某个文件>`，手机上选文件、点 `LinuxBox`；
+2. 看 `[share] writing 0x9953 …` 有没有出现（说明反连成功）；
+3. 看 `/tmp/oshare-ws.log` 里是否出现
+   `phone accepted the transfer request` 与 `sent … for /download`；
+4. 手机 `Documents/realme Share/` 里应出现文件。
+
+如果第 2 步没出现，把 `/tmp/oshare-ble.out` 最后 30 行发我，
+通常是手机地址变了（P2P 随机 MAC）或者 `0x9954` 还没出现在它的 GATT 树里。
