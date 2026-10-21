@@ -10,13 +10,12 @@ on:
 permissions:
   contents: read
 
-env:
-  CGO_ENABLED: "0"
-
 jobs:
   test:
     name: test (go ${{ matrix.go }})
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -41,6 +40,8 @@ jobs:
   build:
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
     strategy:
       fail-fast: false
       matrix:
