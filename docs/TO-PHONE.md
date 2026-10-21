@@ -1555,3 +1555,88 @@ adb logcat -s OShare_NettyClient:V OShare_WebSocketClientHandler:V \
 ```sh
 python3 tools/oshare_ws.py --port 50856 --delay 2.0
 ```
+
+---
+
+# 第十六轮：方向搞清楚了——手机上现在是 **HttpP2pClient（接收方）**
+
+把 `ib/b.java` 的 `delay stop server!` 追到了源头：
+
+```java
+// ib/b.java:932
+public final void h0() {
+    this.f15279k.set(true);
+    if (this.f15284p == null) this.f15284p = new d();
+    this.f15274f.postDelayed(this.f15284p, 2 * 1000);   // 2 秒后
+}
+// 触发点（onMessageSent 分支，ib/b.java:483）：
+if (eb.b.m(eVar)) {                        // action:status
+    int type = za.c.x(json, "type");
+    if (type == 2) { h0(); return; }       // ★ 服务端发 status:2 → 我们 2 秒后收摊
+    if (type == 3 && "user interrupt") { h0(); }
+}
+```
+
+也就是说：**我们往 `0x9953` 写了 `port`，手机就变成了 `HttpP2pClient`（客户端/接收方）**，
+它在等**我们**（`HttpWlanServer` 角色）发 `action:status` 并把文件通过 `/download` 推给它。
+
+这与 `OShareServer.ServerCallback.d(JSONObject)` 的代码一致：
+
+```java
+if (oShareServer.f9752m == null)
+    oShareServer.f9752m = new ib.b(...);          // HttpP2pClient
+oShareServer.f9752m.X(aVar, freq, 0, null);       // connectToServer
+```
+
+`ib.b` = **HttpP2pClient**，`fa/p` = **HttpWlanServer**。我们推了 JSON，
+所以手机认为**我们是发送方**。
+
+## 这样一来，`versionNegotiation` 的发起方也应该对调
+
+`fa/p.java`（服务端）在 WS 握手 500ms 后发 `action:0:versionNegotiation`；
+`ib/b.java`（客户端）收到后回 `ack:...`。
+
+我们现在的 `oshare_ws.py` 正是这么做的，所以**顺序没错**。
+
+手机 13 秒断开前最后两条是：
+
+```
+OShare_HttpP2pClient: DeviceProgress: percent = 0
+OShare_HttpP2pClient: delay stop server!
+```
+
+`DeviceProgress` 来自 `mb.u.a.a(i10, j10)` —— 传输进度回调。
+`percent = 0` 说明它认为传输已经开始（但 0%），然后走 `h0()` 的 2 秒延迟收摊。
+**`h0()` 也可能不是只有 `action:status` 会调**——`b()`（onClose）里没有，但
+`ib/b.java:187` 那段失败处理也走 `f15270b.o()`。
+
+所以最可能的是：**我们回 WS 101 之后，手机把它当成"HTTP 下载端点"用了**，
+`HttpMessageManager.onConnected` 把 `isConnected` 置 1（日志打印的是**置 1 之前**的值 0），
+然后它尝试 `GET /download?taskId=…`，我们回了 16 字节的 `bytes(range(16))`，
+内容不是合法数据流 → 进度 0 → 失败收摊。
+
+## 下一步（具体、可验证）
+
+1. 让 `oshare_ws.py` 把 `/download` 的请求头**完整打印**（现在只打了 path），
+   并**故意挂起不响应**，看手机是自己超时还是立刻断——这能区分
+   "它没发 download 请求" 和 "它发了但我们回错"。
+2. 若它确实发了 `GET /download?taskId=…`，我们就按抓包里的格式回
+   `Transfer-Encoding: chunked` + 一段合法的 zip/data 流（`cap_p2p.pcap` 里
+   63.8 MB 的那条可以直接拿来对照）。
+3. `versionNegotiation` 的 ack 我们本地已经验证过是对的，保持 `--delay 1.5`。
+
+## 当前完整链路状态
+
+```
+✅ BLE 发现（0x8881 + 0x6666/0x6667 分包）
+✅ 手机连接、读我们 0x9996、写 300 字节分享请求
+✅ 读 0x9954 → 写 0x9953（纯写入，无通知、无 CCCD）
+✅ P2P GO 协商：关联 + 4 次握手（PSK 生效）
+✅ DHCP：手机拿到 192.168.49.81
+✅ TLS：wss://192.168.49.1:50856/websocket 握手成功（101）
+✅ 我们的 versionNegotiation / sendRequest 帧格式已本地验证
+⬜ 手机在 13 秒后放弃，原因待定位（DeviceProgress 0 → delay stop server）
+```
+
+这一轮的所有工具都已推到 main：
+`tools/oshare_ble.py`、`tools/push_json.py`、`tools/p2p_go.sh`、`tools/oshare_ws.py`。
