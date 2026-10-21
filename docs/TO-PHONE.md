@@ -1096,3 +1096,103 @@ gb.a.d().f(port);                                    // ★ 手机作为 client 
 所以 **bluez 补丁只对「手机→Linux」这条路有影响**；「Linux→手机」现在就能做，
 建议先把这条打通（`ib.b` 是标准的 HttpP2pClient，`transfer/` 那套 TLS 服务端正好对得上），
 再回头决定要不要为了反方向给 BlueZ 打补丁。
+
+---
+
+# 第十一轮实测：**0x9953 的 JSON 写入被手机接受了！**
+
+## 实验结果（笔记本侧，刚才）
+
+```sh
+# 1) 读 0x9954 -> 手机把它自己的 AP 信息返回给我们（transferType 置 2）
+$ python3 tools/push_json.py --match 79:5F --ssid "DIRECT-aa-fastCon" --port 50856
+[15:36:33] 0x9954 -> 171B {"state":1,"mac":"86:8e:20:89:c9:a2","key":"MFkwEwYHKoZIzj0…"}
+[15:36:33] writing 0x9953: {"port":50856,"freq":2437,"mac":"4cd577f02f01","ssid":"DIRECT-aa-fastCon","psk":"","key":""}
+[15:36:33] write accepted
+```
+
+手机 logcat 立刻回应（**同一秒**）：
+
+```
+OShare_BleServer: onCharacteristicReadRequest()
+OShare_BleServer: OTHER BAND  :false                       <- 读 0x9954
+OShare_BleServer: onCharacteristicWriteRequest responseNeeded: true offsetValue: 0
+OShare_BleServer: onCharacteristicWriteRequest: common share ok      <- ★ JSON 解析通过
+OShare_OShareServer: write data: port = 50856, frequency = 2437      <- ★ ServerCallback.d
+OShare_HttpP2pClient: connectToServer:OShare Device | Service Name: null TTP: ._tcp.
+    Human-Readable Name: null frequency = 2437 transfer version = 0
+OShare_OShareServer: mHttpP2pClient connect to server
+OShare_WifiP2PManager: registerWifiP2pListener, mReceiverRegistered = true
+```
+
+**这是第一次让手机主动走到 `HttpP2pClient.connectToServer`**，
+全程只用了一条 GATT 读取 + 一条 GATT 写入，**零通知、零 CCCD**。
+你的路径 B 是对的。
+
+## 随后它放弃了，原因是我们给了空的 ssid/psk
+
+```
+15:36:53 OShare_WifiP2PManager: Stopping network service...
+15:36:53 OShare_WifiP2PManager: unregisterWifiP2pListener
+15:36:53 OShare_WifiP2PManager: Removed WiFi Direct Group.
+15:36:53 OShare_WifiP2PManager: delete persistent group onSuccess
+```
+
+`u9.n.fastConnectPeers`（`u9/n.java` 的 `L5a` 分支）逻辑：
+
+```java
+if (TextUtils.isEmpty(aVar.f23796g /*ssid*/) || TextUtils.isEmpty(aVar.f23797h /*psk*/)
+    || aVar.f23800k /*type*/ >= 20 ...) {
+    WifiP2pConfig cfg = new WifiP2pConfig();
+    cfg.deviceAddress = mac;                    // 没有 ssid/psk -> 走普通协商
+    manager.connect(cfg, listener);
+} else {
+    // 有 ssid+psk 且 type < 20 -> 用 fastCon 直连
+    cfg.setNetworkName(ssid).setPassphrase(psk);
+}
+```
+
+我们给的 `ssid=DIRECT-aa-fastCon`、`psk=""`、`type=0`（默认），
+它会走 `fastConnect` 分支但 psk 为空 → 协商失败 → 删组退出。
+
+## 所以现在我们有两个选择
+
+**A. 让手机连到我们的 AP（真正走通，不需要 BlueBerry/BlueZ 任何通知）**
+
+1. 笔记本用 `create_ap` / `hostapd` 在 wlan0 上开一个 AP，
+   SSID 用 `DIRECT-xx-fastCon`（`xx` 任意两位十六进制），PSK 自己定 8 位；
+2. 同一台机器上跑 TLS 服务（`transfer/` 的角色反过来：我们当服务器），
+   端口自己定，必须和 JSON 里的 `port` 一致；
+3. 读 0x9954 → 写 0x9953：
+   ```json
+   {"port": <我们的端口>, "freq": <AP 信道>, "mac": "<wlan0 的 mac>",
+    "ssid": "DIRECT-xx-fastCon", "psk": "<8 位密码>", "key": ""}
+   ```
+4. 手机会 `manager.connect(deviceAddress=<我们的 mac>, NetworkName/Passphrase)`
+   直连我们的 AP，连上后按 `port` 打我们的 TLS 服务。
+
+**需要的确认：** `"type"`/`freq` 怎么填？`z10 = za.c.z(json)` 会算出一个 20/30/40/42
+的分支值，`u9.n.F()` 用它决定 `setGroupOperatingFrequency`。我们的 JSON 里
+`ssid` 以 `fastCon` 结尾 → `z()` 返回 **42**，`x.g0(42)` = false（合法）。
+手机侧 `f23800k = 42 < 20` 为假，所以 `fastConnect` 分支**不会**用，
+会走 `F()` → 普通 `connect`，也就是说：**我们给的 ssid/psk 会被用来建连**，
+这点和 fastConnect 一样能工作。请确认这个推断。
+
+**B. 我们连手机的 GO（现在能连，但拿不到端口）**
+
+手机建 GO 后 HTTP 服务端口只在 `0x9989` 通知里给，我们收不到。
+所以 B 只能靠扫端口，而手机在等我们 ACK 时**根本不启 HTTP 服务**。
+
+## 我下一步做 A（如果你没异议）
+
+计划：
+1. `hostapd` 起 AP（SSID `DIRECT-aa-fastCon`，PSK `12345678`，信道 6）；
+2. 同时保持 `wlan0` 的 P2P/AP 模式（一张卡做 AP 就不能同时连别的网，
+   但 USB 共享网络的 `enp98s0f4u2` 仍然提供上网，所以不影响我们）；
+3. `transfer/` 里加一个 **server** 模式（现在只有 Push/Receive 的 TCP 帧，
+   还需要 TLS + `/download?taskId=` 的 HTTP 层）；
+4. 读 0x9954 → 写 0x9953（带上真实的 ssid/psk/port）→ 等手机连进来。
+
+需要你确认：**这本子的 `wlan0` 能不能同时跑 hostapd**（有些网卡驱动不支持 AP+STA 并发，
+但我们是 AP-only，应该没问题）。要我先试 `iw list | grep -A5 "Supported interface modes"`
+看看有没有 `AP`？
