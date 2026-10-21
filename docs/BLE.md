@@ -208,3 +208,64 @@ BlueZ refuses to emit the notification, so the phone times out with
 (`database_add_ccc()`), so the descriptor is either not advertised because
 the service was registered with an explicit handle, or the phone reuses a
 stale cache from `/data/misc/bluetooth/gatt_cache_*`.
+
+## ACK semantics (why the phone reports 「发送超时，对方未确认」)
+
+From `ble/impl/w.java` (the phone's own GATT **server**):
+
+```java
+// onCharacteristicWriteRequest, uuid == 0x9985
+byte b = value[0];
+if (b == 1) o(address, value);     // receiver allowed
+else        k(address, char, off); // rejected / cancelled
+```
+
+So the verdict travels as a **write** of `0x01` to the peer's `0x9985`, not as a
+notification. The notification variant (`sendBleAckResult`, Base64 text) is what
+the phone's server sends to *its* peer, but BlueZ will only forward a
+`PropertiesChanged` after a client writes the CCCD — and the ColorOS client
+never writes a CCCD (its `onDescriptorWrite` is empty and it only calls
+`setCharacteristicNotification` locally).
+
+`tools/oshare_ble.py` therefore ACKs by switching roles: when a write arrives it
+connects to the phone as a GATT client and writes `0x01` to the phone's
+`0x9985` (`ack_peer()`), which is exactly what `w.java` expects.
+
+### Android GATT cache
+
+Android caches the peer's attribute database per device address. After changing
+our service layout the phone keeps the old (incomplete) view — that is the usual
+reason a newly added characteristic/CCCD does not show up. Between runs either
+
+```sh
+adb shell su -c 'svc bluetooth disable; sleep 2; svc bluetooth enable'
+```
+
+or change the advertised address / unpair. The phone-side log (below) tells you
+which UUID it is looking at.
+
+### Custom descriptors on the phone's server (`w.G0()`)
+
+The phone does **not** use the standard `0x2902`; it attaches its own
+descriptors to the notifiable characteristics:
+
+| characteristic | descriptor |
+|---|---|
+| `0x9998` | `0x9994` |
+| `0x9996` | `0x9993` |
+| `0x9995` | `0x9992` |
+| `0x9990` | `0x9991` |
+| `0x9989` | `0x9988` |
+| `0x9986` | `0x9987` |
+
+Mirroring them on our side is harmless and may satisfy clients that probe for
+them.
+
+### Watching the phone while testing
+
+```sh
+adb logcat -s BleServer:V BleClient:V BleServer_iPhone:V OShare_:V
+```
+
+`BleServer onCharacteristicWriteRequest …` / `BLE_ACK_DIALOG flag:` /
+`request create GroupOwner` show exactly which step the phone is waiting on.

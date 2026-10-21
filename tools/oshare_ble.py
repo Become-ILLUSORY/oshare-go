@@ -366,7 +366,14 @@ class Characteristic(_Object):
                 parse_payload(self.name, text, data)
         except UnicodeDecodeError:
             pass
-        if self.name == "ACK_DIALOG" and AUTO_ACK:
+        dev_path = None
+        if isinstance(options, dict):
+            dev_path = options.get("device")
+        if dev_path and AUTO_ACK and self.name in ("ACK_DIALOG", "WPS_RESULT", "SHARE_CMD"):
+            log(f"[ack] peer device {dev_path}, scheduling ACK")
+            ack_peer(self.bus, str(dev_path))
+
+        if False and self.name == "ACK_DIALOG" and AUTO_ACK:
             # The phone wrote its share request and is now waiting for the
             # receiver's verdict on 0x9985: plain "ok" / "no" / "time",
             # Base64-encoded (ble/impl/w.java i1()).
@@ -456,6 +463,61 @@ def parse_payload(name, text, raw):
 # --------------------------------------------------------------------------
 # modes
 # --------------------------------------------------------------------------
+ACK_CHAR_UUID = "00009985-0000-1000-8000-00805f9b34fb"
+
+
+def ack_peer(bus, dev_path, payload=b"\x01", delay_ms=300):
+    """Write the allow-ACK to the *phone's* 0x9985 characteristic.
+
+    The phone is a GATT client towards us, but its own server exposes the same
+    0x9999 service. `ble/impl/w.java` (onCharacteristicWriteRequest) treats a
+    write to 0x9985 as the receiver's verdict: first byte 1 = allow, anything
+    else = reject. BlueZ will not emit our notification until the phone writes
+    the CCCD (it never does), so we ACK by writing to the phone instead.
+    """
+
+    def do_ack():
+        def after_connect(reply, err):
+            if err:
+                log("[ack] connect failed:", err.message)
+                return
+            log("[ack] connected to peer, looking for 0x9985")
+
+            def on_objects(reply2, err2):
+                if err2:
+                    log("[ack] GetManagedObjects failed:", err2.message)
+                    return
+                objs = reply2.unpack()[0]
+                for path, ifaces in objs.items():
+                    if "org.bluez.GattCharacteristic1" not in ifaces:
+                        continue
+                    props = ifaces["org.bluez.GattCharacteristic1"]
+                    if str(props.get("UUID", "")).lower() != ACK_CHAR_UUID:
+                        continue
+                    log(f"[ack] writing {payload.hex()} to {path}")
+
+                    def done(reply3, err3):
+                        if err3:
+                            log("[ack] WriteValue failed:", err3.message)
+                        else:
+                            log("[ack] peer acknowledged (write ok)")
+
+                    bus.call(str(path), "org.bluez.GattCharacteristic1",
+                             "WriteValue",
+                             GLib.Variant("(aya{sv})", (payload, {"offset": GLib.Variant("q", 0)})),
+                             done, timeout=10)
+                    return
+                log("[ack] 0x9985 not found in the peer's GATT tree")
+
+            bus.call("/", "org.freedesktop.DBus.ObjectManager",
+                     "GetManagedObjects", None, on_objects, timeout=10)
+
+        bus.call(dev_path, "org.bluez.Device1", "Connect", None, after_connect,
+                 timeout=20)
+
+    GLib.timeout_add(delay_ms, lambda: (do_ack(), False)[1])
+
+
 def find_adapter(bus, want=None):
     reply = bus.conn.call_sync(
         BLUEZ, "/", OM_IFACE, "GetManagedObjects", None,
