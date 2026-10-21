@@ -353,3 +353,102 @@ if (f.length > 5) {
 
 我这边继续等 adb 恢复，然后按 Q1 的链路把手机的 0x9989/0x9985 通知内容抓出来（HCI 里是加密的，
 但可以用 logcat 的 `BleClient onCharacteristicChanged` 直接读到明文）。
+
+---
+
+# 第四轮：两个问题的答案 + 一条可能绕开通知的新路
+
+## Q1 `onDescriptorWriteRequest` 做了什么？（`--show-bad-code` 完整版）
+
+```java
+public void onDescriptorWriteRequest(BluetoothDevice dev, int requestId,
+                                     BluetoothGattDescriptor desc,
+                                     boolean preparedWrite, boolean responseNeeded,
+                                     int offset, byte[] value) {
+    if (mGattServer == null) { log("GattServer is null, return"); return; }
+    desc.setValue(value);
+    if (responseNeeded) mGattServer.sendResponse(dev, requestId, 0, 0, null);
+}
+```
+
+**就这么两行：存值 + 回 response。没有任何标志位，也没有任何 gating。**
+写 `0x9988` 对 `y0()` 发不发通知**完全没有影响**——你的实验结论（写了也没用）和代码一致。
+
+## Q2 手机给真机对端发 0x9989 时 `notifyCharacteristicChanged()` 成功吗？
+
+先看 `y0()`：
+
+```java
+public final void y0(byte[] data, UUID uuid) {
+    BluetoothGattCharacteristic c = mService.getCharacteristic(uuid);
+    if (c == null || mSelectDevice == null) return;
+    c.setValue(data);
+    try {
+        mGattServer.notifyCharacteristicChanged(mSelectDevice, c, false);  // ← 返回值被丢弃
+    } catch (Exception e) { log(e); }
+}
+```
+
+**返回值被丢掉**，所以代码层面判断不了。但有两个事实可以反推：
+
+1. OPPO ↔ Xiaomi 那两次真实传输**是成功的**，而 0x9989 的 REQUEST_GO 是这条链上唯一的组信息通道
+   ⇒ 安卓侧的 `notifyCharacteristicChanged()` 对这两个"只声明了 read|write"的特征**确实发出去了**
+   （Android 的 GATT server 发送通知时不检查属性位）。
+2. BlueZ 拒绝的原因不是"没有 CCCD"，而是 `StartNotify` 一开始就检查**特征属性位**：
+
+   ```c
+   // bluez/src/gatt-client.c, characteristic_start_notify()
+   if (!(chrc->props & (BT_ATT_CHR_PROP_NOTIFY | BT_ATT_CHR_PROP_INDICATE)))
+           return btd_error_not_supported(msg);
+   ```
+
+   手机把 0x9989/0x9985 声明成 read|write，所以 BlueZ 连 CCCD 那步都没走到就 NotSupported 了。
+
+**结论：协议没坏，是 BlueZ 的策略在挡。** 客户端想做就要么打补丁（把这个属性检查去掉，
+并在没有 CCCD 时也置 `notifying = true`），要么换非 BlueZ 的 peripheral/central。
+
+## 但先别急着打补丁——0x9996 是可以「拉」的
+
+`0x9996` 的值不是静态的，是**每次读的时候现算**（`w.java` 读处理里的 task 回调，约 1214 行）：
+
+```java
+sb2.append(x.w(ctx));                  // 本机 Wi-Fi MAC
+sb2.append("&").append(3);             // 协议版本 3
+if (G /*MTU 已协商*/ || DcpManager.p()) {
+    String pub = b0.o().q(null);       // "getServerPublicCode"
+    sb2.append("&").append(pub);       // 字段 2：EC P-256 公钥（DER SPKI → base64）
+    sb2.append("&").append("1");       // 字段 3
+    sb2.append("&").append("1");       // 字段 4 = 随机端口标志
+    g2.b w = b0.w(pub);                // ★ 用这个公钥做 ECIES 容器
+    if (w != null)
+        sb2.append("&").append(za.c.d(b64(w.c()), b64(w.b()), b64(w.a())));  // {"info","salt","sign"}
+}
+```
+
+而 `b0.w(pubkey)`：
+
+```java
+f2.a a = new f2.a();
+a.b(params);                 // 2 字节随机 + "share"
+return a.c(pubkeyBytes);     // ECDH → KDF → 加密，返回 {a,b,c} = {sign, salt, info}
+```
+
+`f2.a.c()` 内部走 `d2.a`/`d2.b`/`i2.a`（SHA-256/HMAC + 密钥派生，部分调用会抛
+`TAInterfaceException`，说明有 TEE 参与，但算法原语都在这三个类里）。
+
+**关键推断**：`q(null)` 返回的是 "server public code"——如果它在读了对端的 0x9996 之后被缓存成
+**对端的公钥**，那么这段 `info` 就是**加密给对端**的，对端用私钥就能解出 GO/AP 凭据。
+那就完全不需要任何通知：**读两次 0x9996 就够**（第一次让手机看到我们的公钥，第二次拿到加密凭据）。
+
+### 建议的验证顺序
+
+1. Linux 端生成 EC P-256 密钥对，把公钥 base64(DER SPKI) 放进我们 0x9996 的字段 2：
+   `<wifi-mac>&3&<pub>&1&1`（字段 5 的签名块可以先不放，`f.length<=5` 会走 `P1()` 放行）。
+2. 让手机读一次（它已经在读了），**再读手机 0x9996**：
+   * 如果 `info` 变了 / 能解出 `{"ssid","psk","ip","port"...}` → 通知这条路可以彻底放弃；
+   * 如果 `info` 仍是给手机自己公钥加密的 → 再看 `b0.o().q(null)` 到底缓存谁的公钥（
+     `l(String)` / `f12019a` map 是 keyed by taskId，值得单独看一眼）。
+3. 同时打开 `adb logcat -s EncryptOrDecryptUtil:V BleServer:V`，手机在读写 0x9996 时会打印
+   `getServerPublicCode` 相关信息，能直接看出它缓存的是谁的公钥。
+
+如果 2 成立，我们就能只用 **read** 完成整个握手，BlueZ 的 CCCD/属性检查问题一笔勾销。
