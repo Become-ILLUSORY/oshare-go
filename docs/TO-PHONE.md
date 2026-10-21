@@ -1890,3 +1890,65 @@ python3 tools/push_json.py --match 真我 --port 50856 \
 2. `tools/oshare_ws.py` 是 Python 原型；下一步应该用 `transfer/` + `crypto/tls`
    在 Go 里重做（HTTP/1.1 chunked + WebSocket 握手都不复杂）。
 3. 反方向（Linux → 手机）只需把上面四步对调，代码都在 `transfer/` 里。
+
+---
+
+# 第十九轮：反向（手机 → Linux）工具已写好并用假发送方验证过
+
+## 新增两个工具
+
+```sh
+# 终端 1（root）：加入手机的 P2P 组，自动读 p2p_supplicant.conf 的当前 PSK
+sudo ./tools/p2p_join.sh
+
+# 终端 2：拉取文件
+python3 tools/oshare_recv.py --host 192.168.49.1 --port <端口> --dir ./received
+# 不知道端口就省略 --port，会扫 40000-65535 找能回 101 的那个
+```
+
+## `tools/oshare_recv.py` 做什么
+
+1. `wss://<phone>:<port>/websocket` 握手；
+2. 收 `action:0:versionNegotiation?{"versions":[…]}` → 回
+   `ack:0:versionNegotiation?{"version":N}`；
+3. 收 `action:0:sendRequest?{id,totalSize,fileCount,…}` → 回 `ack:0:sendRequest`
+   （这一条就是我们"同意接收"，手机不需要弹框）；
+4. 另开一条 TLS：`GET /download?taskId=<id>`，按 `Transfer-Encoding: chunked` 解块；
+5. 把 body 当 **ZIP** 解压到 `--dir`，重名自动加 `-1`/`-2`；
+6. 回 `action:0:status?{"taskId":…,"type":1}`。
+
+## 本地验证（用一个假的"手机发送方"）
+
+```
+[ws] <- action:0:versionNegotiation?{"versions":[1]}
+[ws] -> ack:0:versionNegotiation?{"version":1}
+[ws] <- action:0:sendRequest?{"id":"T900",...,"totalSize":168,...}
+[ws] -> ack:0:sendRequest
+GET /download?taskId=T900
+[http] 200 application/zip chunked
+[http] received 156B
+[file] /tmp/recvout/oshare-hello.txt (168B)
+[ws] -> action:0:status?{"taskId":"T900","type":1}
+done: 1 file(s)
+```
+
+文件内容与发送端完全一致（`hello from oshare-go` ×8，168 字节）。
+
+## 真机测试还差一步
+
+手机当发送方时，**端口只在 `0x9989` 的通知里给**，而我们对手机 `StartNotify`
+会被 BlueZ 拒（`0x9989` 的 GATT 属性是 `read|write`，没有 notify）。
+所以：
+
+* `--port` 要么手工从手机 `logcat` 里看（`connectWebSocket to  port NNNNN`），
+* 要么用 `--port 0` 让它扫描——但手机在等 ACK 时**可能还没起 HTTP 服务**，
+  扫不到。这时先让它扫，扫的过程中在手机上点开「接收」对话框。
+
+需要你确认的：手机**当发送方**时，是收到我们 `ack:0:sendRequest` 才起 HTTP 服务，
+还是**建完 GO 就起**？如果是后者，扫描窗口足够；如果是前者，我们就得先握手成功
+才能知道端口，那就得从 `0x9989` 的通知里拿——回到 CCCD 问题。
+
+## 一句提醒
+
+`p2p_join.sh` 会把 `wlan0` 从 NetworkManager 拿走并停掉 TUN 代理，
+你的普通上网会短暂中断（USB 共享网络还在的话不影响）。`Ctrl-C` 会恢复。
