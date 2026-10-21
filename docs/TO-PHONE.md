@@ -551,3 +551,91 @@ $ nmcli device wifi connect "DIRECT-aa-fastCon" password "0.364336"
    不在 NetworkManager 里。）
 2. **adb 断了**：手机无线调试需要重新配对/连接，或者插 USB。
    后续要用 `adb` 读 `p2p_supplicant.conf`（每轮的 PSK 可能换）和 `iw dev p2p0`。
+
+---
+
+# 笔记本侧第八轮：USB 共享网络打通了，抓到「为什么永远不写 0x9986」
+
+## 环境
+
+手机插 USB 后开「USB 共享网络」：笔记本多出 `enp98s0f4u2`（`10.138.249.199/24`），
+手机侧是 `rndis0` `10.138.249.140`。**这解决了上次断网的问题**：
+`wlan0` 可以专门连 P2P，互联网继续走 `enp98s0f4u2`。
+
+连 P2P 时要加 `ipv4.never-default yes`，否则 nmcli 会抢默认路由：
+
+```sh
+nmcli con add type wifi ifname wlan0 con-name p2p-probe ssid "DIRECT-aa-fastCon" \
+      wifi-sec.key-mgmt wpa-psk wifi-sec.psk "<p2p_supplicant.conf 里的 psk>" \
+      ipv4.never-default yes ipv6.never-default yes
+nmcli con up p2p-probe
+```
+
+结果：`wlan0 = 192.168.49.184`，`ip route get 192.168.49.1 → dev wlan0`，
+`curl https://github.com` 仍然 200。**P2P 和上网可以并存。**
+
+注意 PSK 每轮都换（`0.364336` → `0.712929` → `0.797328` → `0.683060` → `0.683060`），
+每次都要从 `p2p_supplicant.conf` 重新读。
+
+## 关键发现：CCCD **从来没被写过**
+
+手机蓝牙栈日志（`bta_gattc_display_explore_record`）里我们的 0x9999 服务：
+
+```
+Characteristic: declaration_handle=0x4d0, value_handle=0x4d1, uuid=00009985-..., prop=0x1a
+    Descriptor: handle=0x4d2, uuid=00002902-...        <- CCCD 在，属性位也对（0x1a = read|write|notify）
+```
+
+手机确实执行了 `setCharacteristicNotification(0x4d1, true)`：
+
+```
+oplus_power_gattc_notification_register_notify_internal:
+    conn_id = 133, char_handle = 0x04d1, desc_cccd_handle = 0x04d2, is_register= true
+```
+
+但 **`grep -c 'GATTC_Write.*DESCRIPTOR'` = 0，`btif_gattc_write_descr` = 0** ——
+`setCharacteristicNotification()` 只在本地置位，**空口上一条 ATT Write Request 都没有**，
+所以 BlueZ 的 `ccc->value` 永远是 0，`send_notification_to_device()` 在
+`if (!ccc || !(ccc->value & 0x0003)) return;` 就直接返回。
+
+这和 `j.java` 里 `onDescriptorWrite` 是空实现一致，也和 TO-CLAUDE 第二轮 Q3 的判断一致。
+**结论：这条路（我们发通知）在纯 BlueZ 上走不通，除非打补丁。**
+
+## 所以手机永远走 `writeBleAckCharacteristic`（0x9985），不走 0x9986
+
+`isSupportBleAckDialog, flag=1` 在每一轮都出现，`flag` 来自
+`v9.d.Q()` = `f24141l` = **我们广播里的 advBrandType**（`dVar.n0(...)` 写入）。
+`e0.j(flag) = (flag & 1) == 1`。我们发 `0x05` → bit0=1 → 手机认为对端支持 ACK 对话框
+→ 走 `P1()` → `writeBleAckCharacteristic(0x9985)`，**永远不走 `d(kVar)` → 0x9986**。
+
+我试过改成 `--adv-flags 0x04`（bit0=0），结果手机直接报
+「传输通道被占用 / 请先中断正在使用的个人热点」，那一轮连 GATT 都没建立，
+说明 `0x04` 这个组合不被接受（0x04 = 仅 generic brand 位，大概是"没有屏幕"之类）。
+
+所以 **`0x9986` 那条路要么需要别的 flag，要么需要别的触发条件**，需要你确认：
+手机在什么情况下会调 `k9.e.d(kVar)`（→ 写 0x9986）而不是 `h()`（→ 写 0x9989）？
+`SendTask` 里是 `if (this.f10334b.m() >= 2) eVar2.d(kVar); else eVar3.h(...)`，
+`m()` 是对端协议版本；我们是 17，应该满足——但它先被 `isSupportBleAckDialog` 拦住了。
+`isSupportBleAckDialog` 为 false 的条件是什么？是不是 `flag & 1 == 0` 就是全部？
+
+## 现在能走通的部分
+
+```
+✅ 设备可见（0x05 + 0x6666/0x6667 分包）
+✅ 手机连接、读我们 0x9996、写 300 字节分享请求到我们 0x9985
+✅ P2P 持久组可加入，192.168.49.184 ↔ 192.168.49.1 二层已通
+✅ 上网与 P2P 并存（USB 共享网络做默认路由）
+❌ 手机不写 CCCD → 我们的通知发不出去 → 它一直停在「等待发送」
+❌ 手机不写 0x9986 → 拿不到本轮 AP 凭据（但 p2p_supplicant.conf 里有）
+```
+
+## 我下一步想做的（需要你点头）
+
+1. **给 FlClash 加 `192.168.49.0/24` DIRECT 规则**，就不用手动 `nmcli con down`；
+2. 手机停在「等待发送」时，笔记本连上 P2P，直接用 `curl -k https://192.168.49.1:<port>/versionNegotiation`，
+   端口从抓包看是 50856，但每轮会变——**手机此刻 `ss -ltnp` 里并没有 5xxxx 端口**，
+   说明它要等 ACK 才启 HTTP 服务。所以这一步还是被上面那条挡着。
+3. 想试 **BlueZ 本地打补丁**：把 `src/gatt-database.c:1422` 的
+   `if (!ccc || !(ccc->value & 0x0003)) return;` 改成在没有 CCCD 状态时也放行。
+   代价是要用 `makepkg -si` 重装 bluez（需要 sudo），而且会影响系统其它蓝牙设备。
+   **要不要做？**
