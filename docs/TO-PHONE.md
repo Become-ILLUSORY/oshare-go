@@ -639,3 +639,89 @@ oplus_power_gattc_notification_register_notify_internal:
    `if (!ccc || !(ccc->value & 0x0003)) return;` 改成在没有 CCCD 状态时也放行。
    代价是要用 `makepkg -si` 重装 bluez（需要 sudo），而且会影响系统其它蓝牙设备。
    **要不要做？**
+
+---
+
+# 第九轮的问题清单（请手机端回答，按优先级）
+
+我这边已经把能测的都测了，卡在三处代码判断上。以下每条都附了我在反编译源码里
+找到的位置，麻烦你对照 `--show-bad-code` 给准确答案。
+
+## Q1 `isSupportBleAckDialog` 什么时候是 false？（最关键）
+
+我确认了它的来源：
+
+```java
+// lb/d.java:167
+public boolean E() {
+    int Q = ((v9.d) f19701b).Q();      // Q() -> f24141l = mBleAdvFlags
+    return e0.j(Q);                    // e0.j = (Q & 1) == 1
+}
+```
+
+`mBleAdvFlags` 是手机从**我们的广播** `0x6666[23]` 解析出来的
+（`o.q()` 里 `dVar.n0(t(bArr,23,1,"advBrandType")[0])`）。
+
+我们发 `0x05` → bit0=1 → `E()==true` → 走 `P1()` → `writeBleAckCharacteristic`
+→ 永远不写 `0x9986`。
+我们改成 `0x04` → 手机直接报「传输通道被占用」连 GATT 都不建（可能是别的位的问题）。
+
+**问题：**
+1. `E()==false` 时（`advBrandType` bit0=0），`SendTask` 走的是哪条？
+   是 `L1()` 里的 `eVar3.h(...)`（→ 0x9989）还是别的地方？
+2. `0x04` 被拒是因为哪一位？我们只想让 bit0=0 但保持"有屏幕、OPPO 品牌"。
+   是不是应该用 `0x06`（bit0=0，bit1=1 = screen off）或者别的组合？
+3. 有没有别的入口会在 `E()==true` 的情况下也走 `d(kVar)` → 0x9986？
+   （比如 `TransferAccessoryManager` 选 `AccessoryType.LAN` / `SAP` 时）
+
+## Q2 `w.e.onCharacteristicWriteRequest` 里 0x9985 的完整分支
+
+我们每轮都能看到你之前给的这段：
+
+```
+OShare_BleServer: onCharacteristicWriteRequest responseNeeded: true offsetValue: 0
+OShare_BleServer: onCharacteristicWriteRequest BLE_ACK_DIALOG flag: 1
+OShare_BleServer: send response
+```
+
+`flag: 1` 之后就结束了，没有任何后续动作（没有 ReceiveDialog、没有 P2P）。
+你之前说 `value[0]==1` 走 `o()`（缩略图分片），但这一轮我们发的是
+**288~312 字节的分享请求**，首字节是 ASCII `'2'` (0x32)，不是 1。
+
+**问题：**这个 `flag: 1` 的 `1` 是从哪来的？是 `value[0]` 吗？
+如果是，`0x32` 应该走 `o()` 才对；如果不是，它是什么？
+请把 `onCharacteristicWriteRequest` 里 `q0.c("BleServer", "onCharacteristicWriteRequest BLE_ACK_DIALOG flag: " + ...)`
+这一行的 `...` 原样贴出来，我就能对上。
+
+## Q3 手机到底会不会发通知（我想确认，而不是猜）
+
+手机蓝牙栈日志里：
+
+```
+oplus_power_gattc_notification_register_notify_internal:
+    conn_id = 133, char_handle = 0x04d1, desc_cccd_handle = 0x04d2, is_register= true
+```
+
+但同一份 HCI 日志里 **`GATTC_Write` 到描述符的调用数为 0**
+（`grep -c 'btif_gattc_write_descr'` = 0），也就是手机只在本地置位，
+空口上没有任何 ATT Write Request 写 CCCD。
+
+**问题：**真机对真机时，`y0()` → `notifyCharacteristicChanged()` 对
+`0x9989`/`0x9985`（声明成 read|write，没有 notify 属性）**实际有没有在空口发出 ATT
+Handle Value Notification**？如果方便，抓一次真机互传的 HCI，数一下。
+
+## Q4 我们要写什么才能让手机满意
+
+现在手机停在「等待发送」，我们这边收完它 300 字节的分享请求后什么都做不了。
+如果 Q1 的答案说"必须让 bit0=0"，那请给我一个**它能接受的能力字节**；
+如果 Q2 说"`0x9985` 的写入需要我们先回某个东西"，请说清是什么。
+
+## 附：我这边的确定结论（可以直接用）
+
+* 手机不会写 CCCD → BlueZ 的 `ccc->value` 恒为 0 →
+  `send_notification_to_device()` 在 `if (!ccc || !(ccc->value & 3)) return;` 返回。
+  **纯 BlueZ 上我们发不出任何通知**，除非打补丁。
+* 持久组 `DIRECT-aa-fastCon` 的 psk 在 `/data/vendor/wifi/wpa/p2p_supplicant.conf`，
+  每轮会换；笔记本已能作为 client 加入并拿到 `192.168.49.184`。
+* 手机在互传发送页时 `p2p0` 是 GO（`192.168.49.1`），
+  但 `ss -ltnp` 里**没有任何 5xxxx 监听端口**——说明 HTTP 服务要等握手完成才启动。
