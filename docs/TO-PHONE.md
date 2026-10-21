@@ -908,3 +908,93 @@ if (ccc && !(ccc->value & 0x0003))
    `w.e.onCharacteristicWriteRequest` 里 0x9985 的分支，首字节不是 1 时走 `k()`
    （拒绝/取消），那是不是意味着**写 0x00 等于拒绝、写 0x01 等于……」**
    如果是，我们写 0x01 就已经算"应答"了，只是手机还要别的字段？
+
+---
+
+# 第十轮：用 `--show-bad-code` 把 `onCharacteristicWriteRequest` 完整反编译出来了
+
+之前这个方法一直是 `Method not decompiled`。用 jadx 的 `--show-bad-code` 重跑一遍就拿到了，
+下面是**原文**（只保留分支骨架，日志字符串逐字保留）：
+
+```java
+public void onCharacteristicWriteRequest(BluetoothDevice dev, int reqId,
+        BluetoothGattCharacteristic chr, boolean prepared, boolean responseNeeded,
+        int offset, byte[] value) {
+    q0.c("BleServer", "onCharacteristicWriteRequest responseNeeded: " + responseNeeded
+                      + " offsetValue: " + offset);
+    if (mGattServer == null && !DcpManager.r().p()) { ...return; }
+    if (z0(dev)) { ...return; }
+    String addr = dev.getAddress();
+    m info = D.containsKey(addr) ? (m) D.get(addr) : null;
+    if (info == null || !info.a()) {            // a() == hasRead
+        q0.o("BleServer", "can not get deviceinfo! " + addr);
+        return;                                  // ★ 不回 response
+    }
+    if (P0(dev)) { ...return; }                  // 写入设备 != 最后读设备
+    chr.setValue(value);
+    if (!Q0(info)) return;                       // Q0: info.b() == 1 (transferType)
+    ...
+    if (uuid == 0x9990 /*f19010k*/) {
+        /* cancel cmd: value[0]==2 且不在 TRANSITING 时 → f9979x.c(null) */
+    } else if (uuid == 0x9984 /*f19001b*/) {
+        u0.e().k(new String(value));             // log instruction
+    } else if (uuid == 0x9990 /*f19015p*/) {
+        f9979x.c(new String(value));             // ★ start cmd → ServerCallback.c
+    } else if (uuid == 0x9989 /*f19004e*/) {
+        /* 5G 设备直接忽略 */
+        String[] f = new String(value).split("&");
+        C = parseInt(f[0]);                      // 对端协议版本
+        F = f.length > 2 && "1".equals(f[2]);    // 随机端口标志
+        q0.c("BleServer", "request create GroupOwner");
+        f9979x.b(this);                          // ★ 建 GO
+    } else if (uuid == 0x9986 /*f19002c*/) {
+        String s = new String(value);
+        if (f9981z.isEmpty()) B = parseInt(s.split("&")[0]);   // 长度前缀
+        f9981z += s;
+        if (f9981z.length() < B)  { /* 继续收 */ }
+        else if (== B) { f9979x.c(f9981z.substring(idx+1)); }  // ★ 凭据 → ServerCallback.c
+        else { /* 长度异常，丢弃 */ }
+    } else if (uuid == 0x9985 /*f19000a*/) {
+        byte b = value[0];
+        q0.c("BleServer", "onCharacteristicWriteRequest BLE_ACK_DIALOG flag: " + ((int) b));
+        if (b == 1) o(addr, value);   // 缩略图分片
+        else        k(addr, chr, offset);
+    }
+    ...
+}
+```
+
+## 由此确认的三件事
+
+1. **`flag:` 打印的就是 `value[0]`**，和你说的一样。我们之前的 `flag: 1` 确实是自己 `ack_peer` 写的。
+2. **`0x9986`（凭据）和 `0x9989`（建 GO）都通向 `f9979x.c(...)` / `f9979x.b(...)`**，
+   也就是 `OShareServer.ServerCallback.c(String)` → `OShareServer.g(str)`。
+   这条路径是**对端写给我们**时启动组/收凭据，也就是「手机当接收方」的方向。
+3. `0x9985` 的写入 `o()` 里第一句就是
+   ```java
+   if (bArr.length < 5) return;
+   int off = utils.l.a(bArr, 1);              // 后 4 字节当 offset
+   aVar.f(off, Arrays.copyOfRange(bArr, 5, ...));
+   ```
+   **确认是缩略图分片**，`bArr[0]` 只当"是不是分片"的标志，没有"允许/拒绝"语义。
+
+## 所以问题收敛成一句
+
+手机当**发送方**（当前方向）时，它在 `writeBleAckCharacteristic` 之后等的是
+**我们（接收方）发回去的一条通知**，内容是 `w.i1()` 的
+`Base64(softap.d.a(...))` = `{"ssid","psk","ip","port"[,"key"],"isFast"}`。
+这条通知只能走 `0x9985` 的 notify —— 而手机在 GATT 里把它声明成 `read|write`，
+我们自己发时 BlueZ 又要 CCCD。**两边都卡在属性位/CCCD 上。**
+
+请确认：**有没有非通知的替代路径？** 具体想问：
+
+* `j.java` 的 `onCharacteristicChanged` 里处理 `0x9985` 的分支，如果改成
+  `onCharacteristicRead`（即我们**写**到手机某个特征、手机再去读）有没有对应的代码？
+  现在读处理只认 `0x9987`(f19007h) / `0x9996` / `0x9984` / `0x9998`，没看到 0x9985。
+* `OShareServer.ServerCallback` 的四个方法里，`d(JSONObject)` 会解析
+  `port/freq/mac/ssid/psk/key` —— 它是由 `w.java` 的哪条路径触发的？
+  如果它能被"写入某个特征"触发（而不是 notify），那我们就有救了。
+  我在 `w.java` 里找到的触发点是 `0x9998`/`0x9955` 那条 `f9979x.d(json)`，
+  请确认是不是 `0x9953`（PORT_FREQUENCY）写 JSON 就能走到它。
+
+如果能，那整个流程就变成**纯写入**，BlueZ 通知限制完全绕开。
