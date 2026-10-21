@@ -45,6 +45,9 @@ PROPS_IFACE = "org.freedesktop.DBus.Properties"
 
 # Answer the phone's share request automatically with "ok".
 AUTO_ACK = True
+# Push our "connect to me" JSON as soon as the phone sends a share request.
+AUTO_SHARE = False
+SHARE_CONFIG = None   # (port, ssid, psk, freq)
 
 UUID_OS_MAIN = "00008881-0000-1000-8000-00805f9b34fb"   # advertised service uuid
 UUID_SD_ADV = "00006666-0000-1000-8000-00805f9b34fb"    # adv payload
@@ -399,6 +402,13 @@ class Characteristic(_Object):
         if dev_path and AUTO_ACK and self.name in ("ACK_DIALOG", "WPS_RESULT", "SHARE_CMD"):
             log(f"[ack] peer device {dev_path}, scheduling ACK")
             ack_peer(self.bus, str(dev_path))
+        if dev_path and AUTO_SHARE and self.name == "ACK_DIALOG" and SHARE_CONFIG:
+            log(f"[share] peer device {dev_path}, pushing our port after a delay")
+            port, ssid, psk, freq = SHARE_CONFIG
+            GLib.timeout_add(
+                1500,
+                lambda: (push_common_share(self.bus, str(dev_path), port, ssid, psk, freq),
+                         False)[1])
         return None
 
     def _start_notify(self, params):
@@ -481,6 +491,95 @@ def parse_payload(name, text, raw):
 # modes
 # --------------------------------------------------------------------------
 ACK_CHAR_UUID = "00009985-0000-1000-8000-00805f9b34fb"
+OTHER_BAND_UUID = "00009954-0000-1000-8000-00805f9b34fb"
+COMMON_SHARE_UUID = "00009953-0000-1000-8000-00805f9b34fb"
+SHARE_SVC = "00009999-0000-1000-8000-00805f9b34fb"
+
+
+def _p2p_device_mac():
+    """wlan0's MAC with the locally-administered bit set - what wpa_supplicant
+    puts in the P2P device address (4c:d5:.. -> 4e:d5:..)."""
+    try:
+        with open("/sys/class/net/wlan0/address") as fh:
+            raw = fh.read().strip().split(":")
+        raw[0] = "%02x" % (int(raw[0], 16) | 0x02)
+        return "".join(raw)
+    except (OSError, ValueError):
+        return ""
+
+
+def push_common_share(bus, dev_path, port, ssid, psk, freq, mac=None):
+    """Tell the phone where to find us: read 0x9954, then write the JSON to
+    0x9953.
+
+    Reading 0x9954 sets transferType=2 on the phone, which is what makes its
+    onCharacteristicWriteRequest accept the common-share branch. The JSON is
+    the same one OShareServer$ServerCallback.d() parses: it ends up calling
+    HttpP2pClient.connectToServer, i.e. the phone dials us.
+    """
+    mac = mac or _p2p_device_mac()
+    payload = json.dumps({
+        "port": port, "freq": freq, "mac": mac,
+        "ssid": ssid, "psk": psk, "key": "",
+    }, separators=(",", ":")).encode()
+
+    def find(uuid, attempt=0):
+        reply = bus.conn.call_sync(
+            BLUEZ, "/", OM_IFACE, "GetManagedObjects", None,
+            GLib.VariantType.new("(a{oa{sa{sv}}})"), Gio.DBusCallFlags.NONE,
+            10000, None)
+        hits = []
+        svc = {}
+        for path, ifaces in reply.unpack()[0].items():
+            if not path.startswith(dev_path):
+                continue
+            s = ifaces.get(GATT_SVC_IFACE)
+            if s:
+                svc[path] = str(s.get("UUID", "")).lower()
+            c = ifaces.get(GATT_CHR_IFACE)
+            if c and str(c.get("UUID", "")).lower() == uuid:
+                hits.append(path)
+        hits.sort(key=lambda p: svc.get(p.rsplit("/", 1)[0]) != SHARE_SVC)
+        return hits[0] if hits else None
+
+    def step(attempt=0):
+        band = find(OTHER_BAND_UUID)
+        share = find(COMMON_SHARE_UUID)
+        if not band or not share:
+            if attempt < 6:
+                GLib.timeout_add(700, lambda: (step(attempt + 1), False)[1])
+            else:
+                log("[share] gave up: common-share service not exposed")
+            return
+        try:
+            val = bus.conn.call_sync(
+                BLUEZ, band, GATT_CHR_IFACE, "ReadValue",
+                GLib.Variant("(a{sv})", ({},)), GLib.VariantType.new("(ay)"),
+                Gio.DBusCallFlags.NONE, 15000, None)
+            log(f"[share] read 0x9954 -> {len(bytes(val.unpack()[0]))}B")
+        except GLib.Error as e:
+            log("[share] 0x9954 read failed:", e.message)
+        log(f"[share] writing 0x9953 {payload.decode()}")
+
+        def done(reply, err):
+            if err:
+                log("[share] 0x9953 write failed:", err.message)
+            else:
+                log("[share] phone told to dial us, waiting for it to connect")
+
+        bus.call(share, GATT_CHR_IFACE, "WriteValue",
+                 GLib.Variant("(aya{sv})", (payload, {})), done, timeout=15)
+
+    def after_connect(reply, err):
+        if err:
+            log("[share] connect failed:", err.message)
+            return
+        GLib.timeout_add(600, lambda: (step(), False)[1])
+
+    log(f"[share] connecting to {dev_path} to push the common-share JSON")
+    bus.call(dev_path, "org.bluez.Device1", "Connect", None, after_connect,
+             timeout=25)
+
 
 
 def ack_peer(bus, dev_path, payload=b"\x01", delay_ms=300, retries=5):
@@ -694,15 +793,25 @@ def main():
     v.add_argument("--account", default="")
     v.add_argument("--no-ack", action="store_true",
                    help="do not auto-write the 0x01 verdict to the phone")
+    v.add_argument("--share-port", type=int, default=0,
+                   help="also push our port/SSID/PSK to the phone once it asks "
+                        "(enables the one-tap flow)")
+    v.add_argument("--share-ssid", default="DIRECT-aa-fastCon")
+    v.add_argument("--share-psk", default="12345678")
+    v.add_argument("--share-freq", type=int, default=2437)
 
     for p in (s, a, v):
         p.add_argument("--adapter", default=None, help="e.g. hci0")
 
     args = ap.parse_args()
 
-    global AUTO_ACK
+    global AUTO_ACK, AUTO_SHARE, SHARE_CONFIG
     if getattr(args, "no_ack", False):
         AUTO_ACK = False
+    if getattr(args, "share_port", 0):
+        AUTO_SHARE = True
+        SHARE_CONFIG = (args.share_port, args.share_ssid, args.share_psk,
+                        args.share_freq)
 
     bus = Bus()
     path = find_adapter(bus, args.adapter)
