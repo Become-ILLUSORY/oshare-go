@@ -515,3 +515,39 @@ FlClash（mihomo TUN 模式）用 `ip rule 9002 → table 2022` 把**所有非�
 另外：我连上持久组之后，手机侧的 `p2p0` 被拆了（`adb` 也跟着断了），
 说明**这个组是互传 App 在分享页里维持的**，关掉 App 或超时就会撤掉。
 测试时要保持手机停在互传的发送页。
+
+---
+
+# 笔记本侧第七轮：TUN 关掉后路由恢复，但 P2P 组已经撤了
+
+```
+$ nmcli con down FlClash          # 临时停掉 TUN
+$ ip route get 192.168.49.1
+192.168.49.1 via 172.27.146.14 dev wlan0 src 172.27.146.184   # 正常了
+
+$ nmcli device wifi connect "DIRECT-aa-fastCon" password "0.364336"
+错误：未发现 SSID 为 "DIRECT-aa-fastCon" 的网络。
+```
+
+路由回到 main 表之后，`wlan0` 在普通 Wi-Fi 上，**手机那轮已经拆了 P2P 组**
+（上节里我们一 join，手机的 `p2p0` 就没了，adb 也断了）。
+结合 `w.G0()` 与 `SendTask` 的行为，这个组是**互传 App 在发送页里临时维持的**：
+手机停在「正在搜索附近设备…」或「等待发送」时才有，退回桌面就撤。
+
+所以正确顺序是：
+
+1. 手机停在互传的发送页，设备列表里能看到 LinuxBox；
+2. 笔记本 `nmcli device wifi connect "DIRECT-aa-fastCon" password "0.364336"`
+   （或 `wpa_cli p2p_connect`）；
+3. `ip route get 192.168.49.1` 必须走 `wlan0`，不是 `FlClash`；
+4. `nc -zv 192.168.49.1 40000-65535` 找这一轮的 TLS 端口；
+5. `curl -k --resolve localhost:PORT:192.168.49.1 https://localhost:PORT/versionNegotiation`。
+
+## 需要你配合的两件事
+
+1. **FlClash 的 DIRECT 规则**：在 GUI 里给 `192.168.49.0/24` 加一条直连，
+   否则每次都得手动 `nmcli con down FlClash`，恢复还得记着 `nmcli con up`。
+   （我这边 `nmcli con up FlClash` 已经报「未知的连接」，说明 TUN 配置在 App 里，
+   不在 NetworkManager 里。）
+2. **adb 断了**：手机无线调试需要重新配对/连接，或者插 USB。
+   后续要用 `adb` 读 `p2p_supplicant.conf`（每轮的 PSK 可能换）和 `iw dev p2p0`。
