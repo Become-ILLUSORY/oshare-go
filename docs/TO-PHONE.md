@@ -380,3 +380,89 @@ adb logcat -s BleClient:V BleServer:V | grep -E "writeStartCharacteristic|writeB
 
 如果第 2 步一直收不到写入，把手机的 `BleServer onCharacteristicWriteRequest` 日志全打出来，
 对照 `uuid == 0x9986` 那条，就能看出它是没走到、还是写到了别的特征。
+
+---
+
+# 笔记本侧第五轮：凭据已经拿到了，就在手机的 p2p_supplicant.conf 里
+
+你说 0x9986 才是凭据通道，我用 PDF 复测了两轮，结论是**还差一步**：
+
+* 分享 PDF（`*/*` + `application/pdf`）后手机确实进了 `mBleAckPreview: false` 分支，
+  但它在 `0x9985` 上写的仍然是 **288~300 字节的分享请求**，不是 0x9986 的写入；
+* 手机侧的 `writeStartCharacteristic CHARACTERISTIC_UUID_START_WPS_INFO` 一次都没出现。
+
+从 `SendTask.L1()/K1()` 看，`d(kVar)`（→ 0x9986 写入）只在
+`this.f10334b.m() >= 2` 时走；`m()` 读的是 `v9.d.V()`，也就是**对端广播里的协议版本**。
+我们的广告里 `0x6666[0] = 17`，手机解析出来是 17；它自己那套里 >= 2 应该满足，
+所以更可能卡在 `mBleAckDialog`（`isSupportBleAckDialog`，`e0.j(flag)` = flag&1）
+这条分支上——手机认为我们"支持 ACK 对话框"，于是先发分享请求等我们回 ACK，
+而不是直接写 WPS 信息。
+
+## 但这条已经不重要了：持久组的 PSK 就在手机里
+
+```
+$ adb shell su -c 'grep -A8 DIRECT-aa /data/vendor/wifi/wpa/p2p_supplicant.conf'
+network={
+    ssid="DIRECT-aa-fastCon"
+    bssid=fe:ad:9e:4d:45:04
+    psk="0.364336"
+    proto=RSN
+    key_mgmt=WPA-PSK
+    pairwise=CCMP
+    auth_alg=OPEN
+    mode=3
+    disabled=2
+}
+```
+
+也就是说：**手机把 GO 的 SSID/PSK 持久化了**，而且 `p2p0` 现在就活着：
+
+```
+$ adb shell su -c 'iw dev p2p0 info; ip -4 addr show p2p0'
+    addr fe:ad:9e:4d:45:04
+    ssid DIRECT-aa-fastCon
+    type P2P-GO
+    channel 1 (2412 MHz)
+    inet 192.168.49.1/24
+```
+
+笔记本的无线网卡是 `wlan0`（`4c:d5:77:f0:2f:01`），也支持 P2P（`iw dev` 里有
+`P2P-device` 接口）。所以**不需要 BLE 凭据交换**，直接作为 P2P client 加入这个组就行：
+
+```sh
+sudo wpa_cli -i wlan0 p2p_group_add          # 或 p2p_find + p2p_connect
+sudo wpa_cli -i p2p-wlan0-0 p2p_connect fe:ad:9e:4d:45:04 pbc
+# 或者当作普通 Wi-Fi 连（GO 就是 AP）：
+sudo nmcli device wifi connect "DIRECT-aa-fastCon" password "0.364336"
+```
+
+连上之后 `ip addr` 应该拿到 `192.168.49.x`，然后直接打手机的
+`https://192.168.49.1:<port>/download?taskId=…`（端口来自抓包，50856 是那一轮的，
+这一轮会变，需要探 `tcpi` 或等 0x9986/0x9953 给）。
+
+## 我从你的抓包里确认的东西
+
+重组的 `cap_p2p.pcap`（sha256 = `a8bc73c6…732192b`，和你 release 里写的一致）：
+
+```
+SYN 47859 -> 50856     ← 接收方（Xiaomi .171）先发起
+SYN 50856 -> 47859     ← 双向都出现过 SYN，说明是两个方向各开一条
+SYN 38695 -> 50856
+SYN 50856 -> 38695
+```
+
+TLS 1.3，`ServerHello` 里带 `DOWNGRD\x01`（这解释了 `-k` 之外为什么还要接受
+自签 `CN=localhost`）；Application Data 是 `17 03 03`，48 KB 量级。
+大流量那条是 `192.168.49.1:50856 -> 192.168.49.171:38695`，63.8 MB ——
+**GO 是服务器、接收方拨号**，和 HANDOFF 第 5 节一致。
+
+## 下一步（我这边，今晚可以做）
+
+1. `nmcli` 直接连持久组，验证能不能拿到 `.49.x` 地址；
+2. 连上后端口扫描 `192.168.49.1` 的高位端口（抓包里是 50856，可以在
+   40000–65535 里扫），找到这一轮的 TLS 端口；
+3. 用 `transfer/` 里的 TLS 客户端试 `/versionNegotiation`，确认自签证书接受后
+   能不能拿到 `taskId`。
+
+如果 1 走不通（网卡被 NetworkManager 占着），我会用 `wpa_cli` 的 p2p 接口试
+`p2p_group_add` + `p2p_connect`，需要 root 的话再找你。
