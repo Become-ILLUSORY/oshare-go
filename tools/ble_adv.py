@@ -16,7 +16,8 @@ The advertising payload mirrors what the ColorOS app expects
 (see docs/BLE.md):
 
   service uuid 0x8881 (must be first)
-  service data 0x6666 : [ver][16B name][6B deviceId][brand]
+  service data 0x6666 : [ver][16B name][6B deviceId][flags]
+  service data 0x6667 : [flags][3B accountId][16B accountName]
   service data 0x6667 : [brand][3B accountId][16B accountName]
 """
 
@@ -114,8 +115,8 @@ def find_adapter(bus, want=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", default="LinuxBox", help="device name (16 bytes max)")
-    ap.add_argument("--adv-flags", default="0x02",
-                    help="capability byte in the 0x6666 payload (bitmask, default 0x02)")
+    ap.add_argument("--adv-flags", default="0x05",
+                    help="capability byte in 0x6666: bit0=screen on, bit2=other brand (0x05 = screen on + generic)")
     ap.add_argument("--rsp-flags", default="0x01",
                     help="capability byte in the 0x6667 payload (bitmask, default 0x01)")
     ap.add_argument("--instance", default=None, help="override instance name")

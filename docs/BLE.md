@@ -52,6 +52,21 @@ rsp byte  = 1                                      // always: new protocol
           | 8 / 16 / 24 for band class 101 == 1 / 2 / 7
 ```
 
+Decoded from `com/oplus/oshare/utils/x.java`:
+
+| bit | meaning |
+|---|---|
+| 0 | screen on (1) / off (2) — `PowerManager.isInteractive()` |
+| 2 | generic/OPPO brand (`x.O()` false and `x.o0()` false) |
+| 3 | OnePlus (`Build.BRAND == OnePlus`) |
+| 4 | realme (`Build.BRAND == Realme`) |
+| 5 | tablet (`oplus.hardware.type.tablet`) |
+| 6 | foldable |
+
+So a realme phone advertises `0x11`, an OPPO phone `0x05`, a OnePlus `0x09`.
+A Linux peer should send **`0x05`** (screen on, generic brand) — that is the
+value `tools/ble_adv.py` defaults to.
+
 The scanner decodes the same bits with `ble/impl/e0.java`
 (`d() = bit3`, `g() = bit4`, `p() = bit5`, `k() = bit6`, `f() = bit1`,
 `r() = bit0`). The exact combination that marks a "PC" is not documented —
