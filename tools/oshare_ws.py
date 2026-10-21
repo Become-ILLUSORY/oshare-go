@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
-"""Minimal OShare HTTPS + WebSocket server to see what the phone sends.
+"""Minimal OShare HTTPS + WebSocket endpoint, mirroring what the phone expects.
 
-TLS serves two things on one port, matching the captures:
+Ports and channels come from the captures (docs/TO-PHONE.md, HANDOFF §5):
 
-    wss://<us>:<port>/websocket        control channel, text frames
-                                       "<flow>:<code>:<name>?<json>"
-    GET    <us>:<port>/download?...    data channel (not implemented yet)
+    wss://<us>:<port>/websocket     text frames "<flow>:<code>:<name>?<json>"
+                                    flow ∈ ack | action
+    GET    <us>:<port>/download     chunked data stream (served here as a stub)
 
-Run with the self-signed cert and point the phone at the port:
-    python3 tools/oshare_ws.py --port 50856 [--cert X --key Y]
+Sequence, from fa/p.java (HttpWlanServer) and ib/b.java (HttpP2pClient):
 
-Every frame is printed raw and, when it parses, as flow/code/name/json.
+    server -> action:0:versionNegotiation?{"versions":[1]}     (500 ms after connect)
+    client -> ack:0:versionNegotiation?{"version":1}
+    server -> action:0:sendRequest?{id,senderId,senderName,fileName,mimeType,
+                                    fileCount,totalSize,wlan}
+
+Every frame is logged verbatim so the next step can be read off the phone's
+replies instead of guessed.
 """
 import argparse
 import base64
 import hashlib
+import json
 import socket
 import ssl
 import struct
-import sys
 import threading
 import time
 
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+VERSIONS = [1]
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=50856)
 ap.add_argument("--cert", default="/tmp/oshare-srv.crt")
 ap.add_argument("--key", default="/tmp/oshare-srv.key")
+ap.add_argument("--no-send-request", action="store_true",
+                help="only do version negotiation")
 args = ap.parse_args()
 
 
@@ -66,11 +74,15 @@ def read_http_head(sock):
 
 
 def ws_frame(payload: bytes, opcode=0x1):
-    return bytes([0x80 | opcode, len(payload)]) + payload
+    n = len(payload)
+    if n < 126:
+        return bytes([0x80 | opcode, n]) + payload
+    if n < 65536:
+        return bytes([0x80 | opcode, 126]) + struct.pack(">H", n) + payload
+    return bytes([0x80 | opcode, 127]) + struct.pack(">Q", n) + payload
 
 
-def parse_frame(sock):
-    """Read one client frame (masked). Returns (opcode, payload)."""
+def read_frame(sock):
     b1, b2 = recv_exact(sock, 2)
     opcode = b1 & 0x0F
     ln = b2 & 0x7F
@@ -85,25 +97,84 @@ def parse_frame(sock):
     return opcode, bytes(data)
 
 
+def parse_msg(text):
+    """flow:code:name?json -> dict, or None."""
+    head, sep, body = text.partition("?")
+    parts = head.split(":")
+    if len(parts) < 3:
+        return None
+    msg = {"flow": parts[0], "code": parts[1], "name": parts[2]}
+    if sep:
+        try:
+            msg["json"] = json.loads(body)
+        except json.JSONDecodeError:
+            msg["raw"] = body
+    return msg
+
+
+class Chan:
+    def __init__(self, sock):
+        self.sock = sock
+        self.mu = threading.Lock()
+
+    def send(self, flow, name, code=0, payload=None):
+        text = f"{flow}:{code}:{name}"
+        if payload is not None:
+            text += "?" + json.dumps(payload, separators=(",", ":"))
+        with self.mu:
+            self.sock.sendall(ws_frame(text.encode()))
+        log(f"[ws] -> {text}")
+
+
+def send_request_payload():
+    """eb/d.java a(boolean): what HttpWlanServer announces before serving."""
+    return {
+        "id": "0001",
+        "senderId": "0123456789abcdef",
+        "senderName": "LinuxBox",
+        "fileName": "oshare-test.bin",
+        "mimeType": "application/octet-stream",
+        "fileCount": 1,
+        "totalSize": 16,
+        "thumbnail": "",
+        "thumbnail_height": 0,
+        "thumbnail_width": 0,
+        "wlan": True,
+    }
+
+
 def handle_ws(sock):
-    log("[ws] upgrade accepted")
+    ch = Chan(sock)
+    # fa/p.java sends the first action half a second after the upgrade, giving
+    # the client's channel a moment to become active.
+    threading.Timer(0.5, lambda: ch.send("action", "versionNegotiation",
+                                         payload={"versions": VERSIONS})).start()
     try:
         while True:
-            op, payload = parse_frame(sock)
+            op, payload = read_frame(sock)
             if op == 0x8:
-                log("[ws] close frame")
+                log("[ws] close frame from peer")
                 return
             if op == 0x9:
                 sock.sendall(ws_frame(payload, 0xA))
                 continue
+            if op != 0x1:
+                log(f"[ws] opcode {op:#x} len {len(payload)}")
+                continue
             text = payload.decode(errors="replace")
-            log(f"[ws] <- {text!r}")
-            head, _, body = text.partition("?")
-            parts = head.split(":")
-            if len(parts) >= 3:
-                log(f"[ws]    flow={parts[0]!r} code={parts[1]!r} name={parts[2]!r}")
-            if body:
-                log(f"[ws]    json={body}")
+            log(f"[ws] <- {text}")
+            msg = parse_msg(text)
+            if not msg:
+                continue
+            if msg["flow"] == "ack" and msg["name"] == "versionNegotiation":
+                ver = (msg.get("json") or {}).get("version", VERSIONS[0])
+                log(f"[ws]    negotiated version {ver}")
+                if not args.no_send_request:
+                    ch.send("action", "sendRequest", payload=send_request_payload())
+            elif msg["flow"] == "ack" and msg["name"] == "sendRequest":
+                log("[ws]    peer accepted the transfer request")
+            elif msg["flow"] == "action":
+                log(f"[ws]    peer action {msg['name']} (not handled yet)")
     except (ConnectionError, OSError) as e:
         log("[ws] closed:", e)
 
@@ -114,30 +185,35 @@ def handle_client(sock, addr):
     try:
         method, path, headers, _rest = read_http_head(sock)
         log(f"[http] {method} {path}")
-        for k in ("host", "upgrade", "connection", "sec-websocket-key",
-                  "user-agent", "content-length"):
+        for k in ("host", "upgrade", "sec-websocket-key", "user-agent"):
             if k in headers:
                 log(f"[http]   {k}: {headers[k]}")
 
-        if headers.get("upgrade", "").lower() == "websocket" and "sec-websocket-key" in headers:
-            key = headers["sec-websocket-key"].encode()
+        if headers.get("upgrade", "").lower() == "websocket":
+            key = headers.get("sec-websocket-key", "").encode()
             accept = base64.b64encode(hashlib.sha1(key + GUID).digest()).decode()
-            sock.sendall(
-                b"HTTP/1.1 101 Switching Protocols\r\n"
-                b"Upgrade: websocket\r\n"
-                b"Connection: Upgrade\r\n"
-                b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n")
+            sock.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                         b"Upgrade: websocket\r\n"
+                         b"Connection: Upgrade\r\n"
+                         b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n")
             handle_ws(sock)
             return
 
-        # Anything else: answer with a small JSON body so the phone logs a
-        # useful error instead of hanging.
+        if path.startswith("/download"):
+            body = bytes(range(16))
+            sock.sendall(b"HTTP/1.1 200 OK\r\n"
+                         b"Content-Type: application/octet-stream\r\n"
+                         b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                         b"Connection: close\r\n\r\n" + body)
+            log(f"[http] served {len(body)} bytes for {path}")
+            return
+
         body = b'{"result":0}'
         sock.sendall(b"HTTP/1.1 200 OK\r\n"
                      b"Content-Type: application/json\r\n"
                      b"Content-Length: " + str(len(body)).encode() + b"\r\n"
                      b"Connection: close\r\n\r\n" + body)
-        log(f"[http] answered 200 for {path} (not a websocket upgrade)")
+        log(f"[http] answered 200 for {path}")
     except (ConnectionError, OSError) as e:
         log(f"[tls] {peer}: {e}")
     finally:
