@@ -1805,3 +1805,88 @@ wss:// websocket 控制通道 → GET /download (chunked zip) → status:1
 `status:1` 是手机自己发的，说明它认为"下载完成"，但解压/落盘那一步没走通。
 需要你确认 `z9/a.java` 里服务端是否应该**按文件逐个 zip 条目**而不是一个大 zip，
 以及 `ra/b.java` 的 `fileId` 参数在单文件时是否需要带上。
+
+---
+
+# 第十八轮：🎉 端到端传输完全成功，文件已落地
+
+上一条里「文件没落到 /sdcard」是我找错了目录——**它落在 `Documents/realme Share/`**：
+
+```
+$ adb shell su -c 'ls -l "/sdcard/Documents/realme Share/"'
+-rwxrwx--- 1 u0_a326 media_rw      168 2026-10-21 16:20 oshare-hello.txt
+
+$ adb shell su -c 'cat "/sdcard/Documents/realme Share/oshare-hello.txt"'
+hello from oshare-go
+hello from oshare-go
+...
+```
+
+手机侧完整日志（`/data/media/0/Android/data/com.coloros.oshare/files/logs/oshare.log`）：
+
+```
+16:19:59 HttpP2pClient: receive msg:{"versions":[1]}
+16:19:59 HttpMessageManager: sendMessage: mConnectState = 1
+16:19:59 HttpP2pClient: onMessageSent: versionNegotiation
+16:19:59 HttpP2pClient: has bitmap =            <- thumbnail 为空，正常
+16:19:59 ConfirmSeedlingCard: startSeedling previewSrc: {{$r('images.preview_unknow')}}
+16:20:01 ConfirmSeedlingCard: onReceiveAccept ACCEPT
+16:20:01 ConfirmSeedlingCard: startReceivingSeedling, title: 已接收 0%, dataNum: 1
+16:20:01 DeviceManager: setLocalDeviceState: state = TRANSITING
+16:20:01 HttpP2pClient: start send task: files
+16:20:01 ReceiveFileManager: Http download file getResponse! time = 29
+16:20:01 ReceiveFileManager: nextEntry == oshare-hello.txt        <- ★ 解 zip
+16:20:01 ReceiveFileManager: create file: oshare-hello.txt , size = 168
+16:20:01 SandBoxFileUtils: create file = Documents/realme Share/...oshare-hello.txt
+16:20:01 HttpP2pClient: onReceiveFile
+16:20:01 HttpP2pClient: DeviceProgress: percent = 100
+16:20:01 ReceiveFileManager: write file ok
+16:20:01 HttpP2pClient: onReceiveEnd
+16:20:01 HttpP2pClient: receive end:1
+```
+
+## 完整链路（全部实测通过）
+
+```
+BLE 广播（0x8881 + 0x6666/0x6667 分 ADV/SCAN_RSP）
+  → 手机列表出现 LinuxBox
+  → GATT 连接：读 0x9996（五字段，含 EC 公钥）
+  → 手机写 300B 分享请求到我们 0x9985
+  → 我们读 0x9954（transferType=2）+ 写 0x9953 JSON（port/mac/ssid/psk）
+  → 手机 P2P connectToDevice → 关联我们建的 GO
+  → 4 次握手（PSK 12345678）→ DHCP 192.168.49.81
+  → wss://192.168.49.1:50856/websocket（101）
+  → action versionNegotiation ⇄ ack
+  → action sendRequest ⇄ ack
+  → GET /download?taskId=0001 → chunked application/zip
+  → action status{"type":1}
+  → 文件落到 /sdcard/Documents/realme Share/
+```
+
+**没有任何一步依赖 BlueZ 的通知能力**，CCCD 的问题从头到尾被绕开了。
+
+## 复现命令
+
+```sh
+# 终端 1（root）：P2P GO + DHCP + 防火墙 + TLS/WS 服务
+sudo ./tools/p2p_go.sh "DIRECT-aa-fastCon" "12345678" 50856
+
+# 终端 2：手机上选好文件、点 LinuxBox 之后
+python3 tools/push_json.py --match 真我 --port 50856 \
+        --ssid "DIRECT-aa-fastCon" --psk "12345678" --freq 2437 --mac 4ed577f02f01
+
+# 想发真实文件：
+#   sudo ./tools/p2p_go.sh ... 换成
+#   python3 tools/oshare_ws.py --port 50856 --file /path/to/file
+```
+
+> `--mac` 必须是 **P2P-device** 的地址（`iw dev` 里 `type P2P-device` 那个），
+> 不是 GO 接口 `p2p-wlan0-0` 的地址。两者不同（`4e:d5:...` vs `4a:d5:...`）。
+
+## 还能改进的
+
+1. `p2p_go.sh` 现在固定 `192.168.49.1/24`、固定 SSID/PSK——
+   真正的实现应该随机生成 PSK，并通过 0x9953 的 JSON 告诉手机（这已经支持了）。
+2. `tools/oshare_ws.py` 是 Python 原型；下一步应该用 `transfer/` + `crypto/tls`
+   在 Go 里重做（HTTP/1.1 chunked + WebSocket 握手都不复杂）。
+3. 反方向（Linux → 手机）只需把上面四步对调，代码都在 `transfer/` 里。
