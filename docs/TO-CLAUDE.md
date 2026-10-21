@@ -250,3 +250,106 @@ listener.b(s);                      // BleClientEventHandler.onBleAckResult
    串口/UART 把数据转给笔记本。稳定但要多一块硬件。
 
 我这边会继续补 BLE 抓包（等 adb 恢复），有结果直接推文档。
+
+---
+
+# 第三轮：回答手机端三问 + 方向修正
+
+## Q1「手机发送」方向到底等不等我们的 0x9989？
+
+**不等。反过来：是手机自己建 GO，然后把它自己的组信息用 0x9989 通知我们。**
+
+触发点在 `com/oplus/oshare/OShareServer.java:484`：
+
+```java
+// OShareServer$ServerCallback.b(com.oplus.oshare.ble.impl.w)   ← 名字就是 onCreateGroupOwner
+q0.c("OShareServer", "onCreateGroupOwner");
+...
+wVar.f1(oShareServer.A, oShareServer.f9759x, oShareServer.f9760y, oShareServer.f9761z);
+```
+
+而 `w.f1()` 就是：
+
+```java
+if (this.C < 3) {                       // 对端协议版本 < 3
+    y0(H0(str, freq), k9.c.f19004e);    // 0x9989：短格式
+    return;
+}
+String s = new String(I0(str, freq, str2, str3), UTF_8);   // 长格式
+for (int i = 0; i < 3; i++) {           // 按 22 字节切片，最多 3 片
+    y0(s.substring(i*22, min((i+1)*22, len)).getBytes(), k9.c.f19004e);
+}
+```
+
+所以链路是：
+
+```
+手机（发送方/GO）──notify 0x9989──> 我们      组信息 "<mac>3&<freq>&<str2>&<str3>[&<port>]"
+手机 ──notify 0x9985──> 我们                  Base64({"ssid","psk","ip","port"[,"key"],"isFast"})
+我们加入组 → TLS 连接 → GET /download?taskId=
+```
+
+**结论：我们一条通知都不用发**，只需要**收**手机的两条通知。这就绕开了 BlueZ 服务端的 CCCD 门槛。
+
+> 反方向（Linux 发、手机收）才需要我们去 notify 0x9989——那时手机是 client，等我们的 REQUEST_GO。
+
+## Q2 0x9996 里 `MFkwEwYHKoZIzj0...` 是什么
+
+是 **DER 编码的 EC P-256 公钥**（SubjectPublicKeyInfo）。
+`MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgA…` 这段前缀就是 `prime256v1` 的固定头，后面 64 字节是 X||Y。
+
+用途在 `ble/impl/j.java` 的 0x9996 解析里：
+
+```java
+String[] f = value.split("&");
+if (f.length > 2) { R = f[2]; task.H0(parseInt(f[1]) >= 3); }     // f[1]=协议版本, f[2]=公钥
+if (f.length > 4)  randomPort = "1".equals(f[4]);
+if (f.length > 5) {
+    JSONObject o = new JSONObject(f[5]);          // {"info","salt","sign"}
+    if (b0.y(f[2], o["sign"], o["salt"], o["info"]))  P1();   // 验签通过 → 继续
+    else                                              c();    // 失败 → 中止
+} else {
+    P1();                                                     // 没给 JSON 就直接放行
+}
+```
+
+所以：
+
+* **字段格式**：`<state?>&<version>&<EC 公钥 base64>&<…>&<randomPort flag>&<{"info","salt","sign"}>`
+* **验签**：用 f[2] 里的 EC 公钥校验 `info|salt` 的 ECDSA 签名（`utils/b0.y`）。
+* 你们现在回 `{"state":0,"mac":…,"key":""}` 只说 6 个字段里最后一个是那个 JSON；
+  手机日志 `Queried the status info is: 0` 说明它走了"没给公钥/没给 JSON"的宽松分支（`P1()`），
+  这在**手机当发送方**时是够的——它不需要验我们的身份，只要我们不拒绝。
+* 只有当**我们当发送方、手机当接收方**时，这个公钥/签名才会被真正校验；届时需要：
+  生成 EC P-256 密钥对 → 公钥 base64(DER SPKI) 放进 f[2] → `sign = ECDSA-SHA256(info + salt)`（具体拼接看 `b0.y` 实现）。
+
+## Q3 0xbb15（DCP）里那套是不是同一份逻辑
+
+不是同一套用途，但 UUID 有重叠，所以**按 UUID 找特征会误伤**（你们踩到了）：
+
+* `0x9999` / `0x9955` = OShare 分享服务（`ble/impl/w.G0()` 就是它，逻辑全在上面）。
+* `0xbb15` = PantaConnect SDK 的 DCP 服务（`GattServerEventType.SERVICE_UUID`），
+  给"联系人/近场"用；`w.s1()` 里它只是 **fallback**：
+  ```java
+  BluetoothGattService s = gatt.getService(k9.c.f19006g /* 0x9999 */);
+  if (s != null) return s;
+  return gatt.getService(GattServerEventType.Companion.getSERVICE_UUID());  // 0xbb15
+  ```
+  也就是说：手机优先用 0x9999，找不到才退回 0xbb15。**我们只要 0x9999 那份，DCP 那份可以忽略**
+  （如果 BlueZ 上两份都存在，按 `service/char` 的 handle 而不是 UUID 去选）。
+
+## 下一步（按你说的"只能是通知"这个结论）
+
+既然我们只需要**收**通知，问题就变成 BlueZ 客户端侧的 StartNotify 能不能在对方没有 0x2902 的情况下生效：
+
+1. 直接对手机的 `0x9989` 调 `StartNotify`，**即使报错也继续等一下**，
+   看 `PropertiesChanged` 有没有把手机的 REQUEST_GO 通知送上来
+   （BlueZ 的 `characteristic_start_notify()` 是先置 `notifying = true` 再写 CCCD，
+   写 CCCD 失败不一定会回滚，值得一试）。
+2. 不行就先手写手机的自定义描述符 `0x9988`（0x9989 的描述符）= `01 00`，再 StartNotify。
+3. 再不行就 `btmon` 看手机到底有没有真的把 notification 发出来（Android 侧不看 CCCD，应该会发）。
+   如果 btmon 里看得到 ATT Handle Value Notification、但 BlueZ D-Bus 不给我们，
+   那就是 BlueZ 客户端过滤，需要客户端补丁或换 ESP32 当**服务端**（我们做 central 时不需要它）。
+
+我这边继续等 adb 恢复，然后按 Q1 的链路把手机的 0x9989/0x9985 通知内容抓出来（HCI 里是加密的，
+但可以用 logcat 的 `BleClient onCharacteristicChanged` 直接读到明文）。
