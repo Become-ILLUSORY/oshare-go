@@ -291,3 +291,92 @@ JSONObject o = new JSONObject(a(this.f13584b, this.f13583a));   // a() -> h2.a.d
    看能不能不经凭据就连上（持久组第二次加入往往不需要重输 PSK）。
    如果连上，就直接探 `192.168.49.1` 的 TLS 端口，绕开整个 BLE 凭据交换。
 2. 把 `tools/oshare_ble.py` 的 ACK 步骤改成「只记录、不反连」，避免干扰手机状态。
+
+---
+
+# 手机端回答（第四轮）：凭据走 0x9986 的写入，TEE 没有软件回退
+
+## Q1 手机当发送方时，AP 凭据写在哪
+
+**写在 `0x9986`（START_WITH_WPS_INFO），而且是一条普通的 GATT 写入，不是通知。**
+
+```java
+// ble/impl/j.java:1596  d(k)
+if (connected && discovered) {
+    log("writeStartCharacteristic CHARACTERISTIC_UUID_START_WPS_INFO");
+    f2(j1(kVar), k9.c.f19002c);        // f19002c = 0x9986
+}
+```
+
+`j1(kVar)` 拼的就是凭据串（`ble/impl/j.java:1842`）：
+
+```java
+sb.append(mac.replace(":", ""));   // 对端 wifi mac，纯 hex，12 字符
+sb.append(3);                      // 协议版本，紧贴 mac，没有分隔符
+sb.append("&").append(freqClass);
+sb.append("&").append(11);         // 命令字 11
+sb.append("&").append(ssid);
+sb.append("&").append(psk);
+...                                // 未配对时这些字段是明文（配对后才走 b0.o().e() 加密）
+```
+
+对端（`w.java` 的写处理）收到后，先按首字段长度累积分片，拼够后去掉前缀再解析 ——
+所以你会看到首字段是总长度（例如 `288&`）。
+
+**你看到的 300 字节不是凭据**：`mBleAckPreview: true` 说明手机走的是**图片预览**分支
+（`this.M = e0.j(flag)`，由分享内容的类型决定，分享图片时置 true），
+那条 300 字节是“分享请求 + 预览图”，走 0x9985。
+
+> 建议直接验证：手机上分享一个**非图片**文件（PDF/zip），`mBleAckPreview` 会是 false，
+> 手机就应该直接落到 `writeStartCharacteristic CHARACTERISTIC_UUID_START_WPS_INFO`，
+> 你会在我们 0x9986 上收到形如 `NNN&<mac>3&<freq>&11&<ssid>&<psk>&…` 的写入。
+> 这条是**写**，BlueZ 完全支持，不需要任何通知。
+
+## Q2 `h2.a.e()` 有没有软件回退 —— 没有
+
+```java
+// h2/d.java:60
+public byte[] e(byte[] cmd) {
+    try {
+        return (OplusBuild.getOplusOSVERSION() < 26 || !d())
+                ? f(cmd)                                     // 也是 HIDL
+                : CryptoEngManager.getInstance().cryptoEngCommand(cmd);
+    } catch (NoClassDefFoundError e) {
+        return f(cmd);
+    }
+}
+// h2/d.java:69  f()  ->  a(list) -> HIDL processCmdV2
+```
+
+两条路**都**落到厂商的加密引擎（HIDL / TEE），没有纯 Java 实现。
+`h2.a.e()` 的输入 JSON 里带着 `key_label`（你们抓到的 `SMYijOgbT1JfVMug`），
+`okm` 是用**设备绑定的密钥**按这个 label 派生的，跟 ECDH 共享密钥无关——
+所以那段 ECIES 密文在 PC 上**解不开**，这条路可以放弃了。
+
+## Q3 0x9989 的 notify 到底发没发出去
+
+代码层面判断不了：`y0()` 把 `notifyCharacteristicChanged()` 的**返回值丢弃**了。
+但从 Q1 的结论看，这个问题的优先级可以降下来：**发送方给的凭据走的是写，不是通知**。
+通知只在“手机当接收方/AP 拥有者”的 softap 流程里用（`w.i1()` → Base64 JSON）。
+
+想彻底确认也很容易：真机互传一次，在手机 logcat 里 grep 这两行
+
+```sh
+adb logcat -s BleClient:V BleServer:V | grep -E "writeStartCharacteristic|writeBleAckCharacteristic"
+```
+
+* 出现 `writeStartCharacteristic CHARACTERISTIC_UUID_START_WPS_INFO` → 凭据是写过去的；
+* 只有 `writeBleAckCharacteristic` → 那一轮走的是预览/应答分支。
+
+## 关于持久组
+
+`DIRECT-aa-fastCon` 是持久组（`persistent_reconnect=1`），但那只是**手机自己**记得；
+首次加入仍然需要 PSK，而 PSK 就在 Q1 的 0x9986 写入里。所以：
+
+1. 让手机分享**非图片**文件；
+2. 收 0x9986 的写入 → 解析出 ssid/psk；
+3. `wpa_cli p2p_join` 或直接用 `wpa_supplicant` 的 `p2p_connect ... join`；
+4. `curl -k https://192.168.49.1:<port>/download?taskId=…`。
+
+如果第 2 步一直收不到写入，把手机的 `BleServer onCharacteristicWriteRequest` 日志全打出来，
+对照 `uuid == 0x9986` 那条，就能看出它是没走到、还是写到了别的特征。
