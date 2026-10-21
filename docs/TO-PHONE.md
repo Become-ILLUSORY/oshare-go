@@ -1384,3 +1384,75 @@ sudo /tmp/p2p_diag.sh
 
 （脚本会等 25 秒抓包，期间请**在手机上重新点一次 LinuxBox**，
 并保持 `p2p_go.sh` 那个终端还开着。）
+
+---
+
+# 第十四轮：**全线打通到 TLS/WebSocket 了**
+
+## 本轮日志（手机侧，16:59:44~49）
+
+```
+15:59:46 wpa_supplicant: p2p0: CTRL-EVENT-CONNECTED - Connection to 4a:d5:77:f0:2f:01 completed
+15:59:47 IpClient/p2p0: addressUpdated: fe80::6c46:78ff:fec9:e000/64
+15:59:49 dnsmasq: DHCPACK(p2p-wlan0-0) 192.168.49.81 6e:46:78:c9:e0:00 realme-GT-7-Pro
+15:59:49 IpClient/p2p0: addressUpdated: 192.168.49.81/24
+15:59:49 OShare_WifiP2PManager: onConnectionInfoAvailable
+15:59:49 OShare_WifiP2PManager: info.groupFormed is: true clientList.size is: 0 isGo: false
+15:59:49 OShare_HttpP2pClient: onConnectSucess: isGo = false, mCanceled = false
+15:59:49 OShare_HttpMessageManager: registerMessageListener
+15:59:49 OShare_NettyClient: http netty connect
+15:59:49 OShare_NettyClient: connectWebSocket to  port 50856          ← ★ 打我们的 50856
+15:59:49 OShare_WebSocketClientHandler: channelActive
+15:59:49 OShare_WebSocketClientHandler: Client failed to connect
+         io.netty.handler.codec.http.websocketx.WebSocketClientHandshakeException:
+         Invalid handshake response                                       ← ★ 我们只回了 200 JSON
+```
+
+**整条链路已经打通到应用层**：
+
+```
+BLE 发现 → GATT 连接 → 读 0x9954 → 写 0x9953 →
+P2P GO 协商（关联 + 4 次握手）→ DHCP（192.168.49.81）→
+TLS 到 192.168.49.1:50856 → WebSocket 升级请求
+```
+
+手机唯一失败的地方是**我们的测试服务器不是 WebSocket 服务端**：
+它发的是 `GET /websocket` 的 Upgrade 请求，我们 `BaseHTTPRequestHandler`
+回了个 `200 {"result":0}`，于是 `WebSocketClientHandshakeException`。
+
+这和 `HANDOFF.md` 第 5 节抓包结论完全一致：
+
+* 控制通道 = `wss://<ip>:<port>/websocket`，文本帧 `<flow>:<code>:<name>?<json>`
+* 数据通道 = `GET https://<ip>:<port>/download?taskId=…`
+
+## 修好的三处（都已推 main）
+
+1. `p2p_go.sh`：`--bind-dynamic`（接口在 group_add 之后才出现）+
+   `ip addr add 192.168.49.1/24` + `dnsmasq` 发 `.10-.200` +
+   `iptables -I INPUT -i p2p-wlan0-0 -j ACCEPT`（默认 DROP 会吃掉 DHCPDISCOVER，
+   现象是接口计数在涨但 dnsmasq 一条日志都没有）。
+2. `push_json.py`：读 `0x9954` → 写 `0x9953`，`mac` 必须用**P2P 设备地址**
+   （`iw dev` 里 `type P2P-device` 的那个，`4e:d5:77:f0:2f:01`），
+   不是 GO 接口的地址（`4a:…`）。
+3. `p2p_go.sh` 的 per-run 日志文件，避免上一轮 dnsmasq 留下的 `nobody` 权限文件挡住启动。
+
+## 下一步：实现 `/websocket` 控制通道
+
+按抓包与 `HANDOFF.md`：
+
+```
+wss://192.168.49.1:50856/websocket
+  文本帧:  <flow>:<code>:<name>?<json>
+  flow ∈ {ack, action}
+  name ∈ versionNegotiation | sendRequest | status | statistic |
+         wlanBandwidth | wlanChanged | logInstruction | extras | oliveSendProgress
+GET https://192.168.49.1:50856/download?taskId=<id>
+  Transfer-Encoding: chunked, body = zip/data stream
+```
+
+我接下来在 `tools/` 里写一个最小的 WebSocket 服务端（RFC6455 握手 + 文本帧），
+把手机发来的第一条 `versionNegotiation` 打出来，然后按它的格式回一条，
+就能看到它接着要什么。这一步不再需要改 BLE 或 P2P。
+
+> 注意：手机连上后会在 ~2 秒内放弃（`CTRL-EVENT-DISCONNECTED reason=3`），
+> 应该是 WebSocket 握手失败后的兜底。实现 WebSocket 后它应该会保持连接。
