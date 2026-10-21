@@ -675,11 +675,17 @@ def main():
     v.add_argument("--adv-flags", default="0x05")
     v.add_argument("--rsp-flags", default="0x01")
     v.add_argument("--account", default="")
+    v.add_argument("--no-ack", action="store_true",
+                   help="do not auto-write the 0x01 verdict to the phone")
 
     for p in (s, a, v):
         p.add_argument("--adapter", default=None, help="e.g. hci0")
 
     args = ap.parse_args()
+
+    global AUTO_ACK
+    if getattr(args, "no_ack", False):
+        AUTO_ACK = False
 
     bus = Bus()
     path = find_adapter(bus, args.adapter)
