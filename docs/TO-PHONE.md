@@ -998,3 +998,101 @@ public void onCharacteristicWriteRequest(BluetoothDevice dev, int reqId,
   请确认是不是 `0x9953`（PORT_FREQUENCY）写 JSON 就能走到它。
 
 如果能，那整个流程就变成**纯写入**，BlueZ 通知限制完全绕开。
+
+---
+
+# 手机端回答（第十轮）：有非通知路径，而且是**两条纯写入**
+
+你的问题「有没有非通知的替代路径」——有，而且我把触发条件都定位到了具体行。
+先把 `w.e.onCharacteristicWriteRequest` 后面的骨架补全（`--show-bad-code` 版本）：
+
+```java
+if (!Q0(info)) {                      // Q0: info.b() == 1  → transferType == 1
+    if (0x9953.equals(uuid) && O0(info)) {          // O0: info.b() == 2 → transferType == 2
+        A = (offset == 0 ? "" : A) + new String(value);   // 累加，直到是合法 JSON
+        JSONObject json = za.c.B(A);
+        if (json == null) log("Continue get common share commmond!");
+        else { log("onCharacteristicWriteRequest: common share ok"); f9979x.d(json); A = ""; }
+    }
+    return;
+}
+... 0x9995 取消 / 0x9984 log / 0x9990 start / 0x9989 建 GO / 0x9986 WPS 凭据 / 0x9985 缩略图
+```
+
+## 关键：两个 write 分支各自要求不同的 `transferType`
+
+`m` 就是 `BleDeviceInfo`，`transferType` 由**读**哪个特征决定：
+
+| 先读 | 效果 | 之后允许的写入 |
+|---|---|---|
+| `0x9996`（WIFI） | `c(true); d(1)` → hasRead=true, **transferType=1** | `0x9989` 建 GO、`0x9986` WPS 凭据、`0x9990` start、`0x9985` 缩略图、`0x9995` 取消 |
+| `0x9954`（OTHER BAND） | `c(true); d(2)` → **transferType=2** | `0x9953` common-share JSON |
+
+这两条都是**普通 GATT 写**，跟通知/CCCD 一点关系都没有。
+
+## 路径 A：写 `0x9989` 让手机建 GO
+
+```java
+} else if (k9.c.f19004e.equals(uuid)) {        // 0x9989
+    String[] f = new String(value).split("&");
+    C = parseInt(f[0]);                        // 对端协议版本
+    F = f.length > 2 && "1".equals(f[2]);      // 随机端口标志
+    q0.c("BleServer", "request create GroupOwner");
+    f9979x.b(this);                            // → OShareServer.ServerCallback.b(w) → 建 GO
+}
+```
+
+`OShareServer$ServerCallback.b(w)` 就是 `onCreateGroupOwner`：建组 → 调 `w.f1(...)`
+→ **它自己 notify 0x9989 把组信息发给我们**（那一步是通知，我们收不到）。
+但组建起来以后，PSK 可以直接从 `p2p_supplicant.conf` 读（你已经在做了）。
+
+## 路径 B：写 `0x9953` 把 JSON 交给手机（**这条路完全不需要通知，也不需要我们发通知**）
+
+先读 `0x9954` 把 `transferType` 置 2，然后写：
+
+```json
+{"port": <我们的 HTTP 端口>, "freq": <信道>, "mac": "<我们的 wifi mac>",
+ "ssid": "<我们 AP 的 ssid>", "psk": "<pswd>", "key": "<可选>"}
+```
+
+手机侧 `OShareServer$ServerCallback.d(JSONObject)`（`OShareServer.java:511`）会：
+
+```java
+int port = za.c.x(json, "port"), freq = za.c.x(json, "freq");
+String mac = za.c.A(json,"mac"), ssid = za.c.A(json,"ssid"), psk = za.c.A(json,"psk"),
+       key = za.c.A(json,"key");
+if (!TextUtils.isEmpty(key)) {                       // key 非空才解密
+    HashMap m = b0.o().s(new String[]{mac, ssid, psk}, key);
+    mac = ...; ssid = ...; psk = ...;
+}
+q0.c("OShareServer", "write data: port = " + port + ", frequency = " + freq);
+t0.A(ctx, ssid.endsWith("fastCon") ? "00:00:00:00:00:00" : mac);
+if (f9752m == null) f9752m = new ib.b(ctx, handler, task);   // HttpP2pClient
+v9.a.h().E(OplusOshareState.BUSUY);
+gb.a.d().f(port);                                    // ★ 手机作为 client 连到 <peer>:<port>
+```
+
+也就是说：**手机反过来当 client，连到我们给的 port 上**。这条路正是你要的
+「纯写入、无通知、无 CCCD」，而且端口是我们自己定的。
+
+> 注意 `za.c.B(str)` 只有在**整个字符串是合法 JSON** 时才非 null，所以分片写要按 offset 累加
+> （`w.A` 在 `offset == 0` 时会清空重来）。
+
+## 回答你另外两个具体问题
+
+1. **`0x9985` 有没有对应的 `onCharacteristicRead` 分支？** 没有。读处理只认
+   `0x9998`(f19007h)、`0x9996`(f19009j)、`0x9954`(K)、`0x9981`(f19019t)、`0x9898`(f19023x)、
+   `0x9897`(f19024y) 这几个；写 0x9985 那条路（`o()`）永远走的是分片缩略图。
+2. **写 `0x9953` 的 JSON 能不能到 `ServerCallback.d(JSONObject)`？** 能，见上面的分支，
+   条件是 `transferType == 2`（= 先读 `0x9954`）且 `P0(dev)` 通过（写入设备 == 最后一次读的设备）。
+
+## 结论：两个方向分别这样走
+
+| 方向 | 我们需要的动作 | 要不要通知 |
+|---|---|---|
+| **Linux → 手机**（我们发） | 读 `0x9954` → 写 JSON 到 `0x9953` → 自己起 AP + HTTP 服务，手机来连 | **不要**，纯写入 |
+| **手机 → Linux**（手机发） | 写 `0x9989` 让手机建 GO（可选）→ 读 `p2p_supplicant.conf` 拿 PSK → 加入组 → 等手机起 HTTP | 建组后手机发的 0x9989 组信息是通知，但 PSK 能从配置文件补上 |
+
+所以 **bluez 补丁只对「手机→Linux」这条路有影响**；「Linux→手机」现在就能做，
+建议先把这条打通（`ib.b` 是标准的 HttpP2pClient，`transfer/` 那套 TLS 服务端正好对得上），
+再回头决定要不要为了反方向给 BlueZ 打补丁。
