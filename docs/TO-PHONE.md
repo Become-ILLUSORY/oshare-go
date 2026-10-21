@@ -466,3 +466,52 @@ TLS 1.3，`ServerHello` 里带 `DOWNGRD\x01`（这解释了 `-k` 之外为什么
 
 如果 1 走不通（网卡被 NetworkManager 占着），我会用 `wpa_cli` 的 p2p 接口试
 `p2p_group_add` + `p2p_connect`，需要 root 的话再找你。
+
+---
+
+# 笔记本侧第六轮：**nmcli 直连持久组成功了**（但被 TUN 代理挡住）
+
+按上一节的思路直接连，一次成功：
+
+```sh
+$ nmcli device wifi connect "DIRECT-aa-fastCon" password "0.364336"
+设备 "wlan0" 成功以 "dead54fd-62f0-4a08-9aa2-8a3aa73c6809" 激活。
+
+$ ip -4 addr show wlan0
+    inet 192.168.49.184/24 brd 192.168.49.255 scope global dynamic wlan0
+```
+
+**笔记本拿到了 `192.168.49.184`，手机是 `192.168.49.1`，二层是通的。**
+所以整条 BLE 凭据通道（0x9986 / 0x9985 / ECIES / TEE）**可以完全跳过**。
+
+## 但 ping 不通，原因是你电脑上的 TUN 代理
+
+```
+$ ip route get 192.168.49.1
+192.168.49.1 via 198.18.0.2 dev FlClash table 2022 src 198.18.0.1 uid 1000
+```
+
+FlClash（mihomo TUN 模式）用 `ip rule 9002 → table 2022` 把**所有非本地流量**
+都送进了 198.18.0.0/30，包括 `192.168.49.0/24` 这个局域网段。所以：
+
+* 之前你提醒我「我电脑开了 TUN 模式的 mihomo，不会是这个原因吧」——**确实是这个原因**，
+  不过它挡住的是**连上 P2P 组之后的 TCP**，不是 BLE（BLE 走的是蓝牙栈，和 IP 无关）。
+* 解决办法二选一：
+  1. 在 FlClash 里给 `192.168.49.0/24`（以及 `192.168.49.1`）加 **DIRECT 规则**；
+  2. 或临时 `sudo ip rule add to 192.168.49.0/24 lookup main priority 8000`
+     （priority 必须小于 9002，才能排在 FlClash 之前）。
+
+## 现在的位置
+
+```
+✅ BLE 发现（0x8881 + 0x6666/0x6667 分包）
+✅ 手机点选 → GATT 连接 → 读我们 0x9996 → 写分享请求
+✅ 持久组 SSID/PSK 已知，笔记本已作为 client 加入，拿到 192.168.49.184
+⬜ 打通 192.168.49.1 的 TCP（被 TUN 挡着，加一条直连规则即可）
+⬜ 找到这一轮的 TLS 端口（抓包里是 50856，每轮会变）
+⬜ /versionNegotiation + /download?taskId=
+```
+
+另外：我连上持久组之后，手机侧的 `p2p0` 被拆了（`adb` 也跟着断了），
+说明**这个组是互传 App 在分享页里维持的**，关掉 App 或超时就会撤掉。
+测试时要保持手机停在互传的发送页。
