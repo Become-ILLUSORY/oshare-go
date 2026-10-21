@@ -29,6 +29,9 @@ say() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 cleanup() {
     say "cleaning up"
+    if [ "${IPT_RULE:-0}" = 1 ]; then
+        iptables -D INPUT -i "$GO_IF" -j ACCEPT 2>/dev/null || true
+    fi
     [ -f /run/oshare-dnsmasq.pid ] && kill "$(cat /run/oshare-dnsmasq.pid)" 2>/dev/null || true
     [ -S "$CTRL/$IFACE" ] && wpa_cli -p "$CTRL" -i "$IFACE" p2p_group_remove "$GO_IF" 2>/dev/null || true
     pkill -f "wpa_supplicant.*$CTRL" 2>/dev/null || true
@@ -104,6 +107,15 @@ fi
 
 GO_IP=$(ip -4 -o addr show dev "$GO_IF" | awk '{print $4}')
 say "GO address: ${GO_IP:-<none>}"
+
+# A firewall that defaults to DROP will silently eat the phone's DHCPDISCOVER:
+# the interface counters still go up, so it looks like dnsmasq is ignoring it.
+if command -v iptables >/dev/null 2>&1; then
+    iptables -I INPUT -i "$GO_IF" -j ACCEPT 2>/dev/null && {
+        say "iptables: INPUT accept on $GO_IF"
+        IPT_RULE=1
+    }
+fi
 
 # --- 4. TLS server on the port the phone was told ------------------------
 if [ ! -f "$CERT" ]; then
