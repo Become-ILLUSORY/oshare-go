@@ -40,6 +40,8 @@ ap.add_argument("--no-send-request", action="store_true",
                 help="only do version negotiation")
 ap.add_argument("--delay", type=float, default=1.5,
                 help="seconds to wait after the upgrade before announcing versions")
+ap.add_argument("--stall-download", action="store_true",
+                help="accept /download but never answer, to see who times out")
 ap.add_argument("--log", default="/tmp/oshare-ws.log",
                 help="also append every line here (world-readable)")
 args = ap.parse_args()
@@ -213,6 +215,13 @@ def handle_client(sock, addr):
             return
 
         if path.startswith("/download"):
+            log("[http] download request headers:")
+            for k, v in headers.items():
+                log(f"[http]   {k}: {v}")
+            if args.stall_download:
+                log("[http] stalling (--stall-download), peer must time out")
+                time.sleep(120)
+                return
             body = bytes(range(16))
             sock.sendall(b"HTTP/1.1 200 OK\r\n"
                          b"Content-Type: application/octet-stream\r\n"
