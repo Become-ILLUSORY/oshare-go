@@ -22,7 +22,6 @@ Protocol notes live in docs/BLE.md.
 """
 
 import argparse
-import base64
 import json
 import os
 import signal
@@ -372,17 +371,7 @@ class Characteristic(_Object):
         if dev_path and AUTO_ACK and self.name in ("ACK_DIALOG", "WPS_RESULT", "SHARE_CMD"):
             log(f"[ack] peer device {dev_path}, scheduling ACK")
             ack_peer(self.bus, str(dev_path))
-
-        if False and self.name == "ACK_DIALOG" and AUTO_ACK:
-            # The phone wrote its share request and is now waiting for the
-            # receiver's verdict on 0x9985: plain "ok" / "no" / "time",
-            # Base64-encoded (ble/impl/w.java i1()).
-            GLib.timeout_add(500, self._ack, b"ok")
         return None
-
-    def _ack(self, verdict: bytes):
-        self.notify(base64.b64encode(verdict))
-        return False
 
     def _start_notify(self, params):
         self.notifying = True
