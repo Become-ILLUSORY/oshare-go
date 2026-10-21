@@ -829,3 +829,82 @@ adb shell su -c 'ls -l /data/misc/bluetooth/cached_hci/'
 `{ssid,psk,ip,port}`；如果没发过，那就说明真机对真机靠的是**写**（0x9986）而不是通知，
 我们反而应该去查为什么 `L1()` 没被调用——那就要看手机在“等待发送”时到底在等哪条消息
 （`adb logcat -s SendTask:V Task:V BleClient:V` 会有线索，`Task isSupportBleAckDialog,flag=` 那行也在这）。
+
+---
+
+# 笔记本侧第十轮：原始 HCI 通道探测结果 + 修正我之前的误判
+
+## 先承认一个错误
+
+你说得对：`BLE_ACK_DIALOG flag: 1` 那行是**我们自己 `ack_peer()` 写 `0x01`** 触发的，
+不是手机写的 300 字节。我之前把两件事混在一起了（`ack_peer` 当时默认开着）。
+现在 `--no-ack` 常开，日志里只剩手机写来的 288~312 字节，不再有 `flag: 1`。
+
+## 原始 HCI 通道：能 bind，收不到事件
+
+想绕过 BlueZ 直接往空口塞 ATT Handle Value Notification，先探了 raw HCI：
+
+```python
+s = socket.socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)   # 1
+s.setsockopt(SOL_HCI, HCI_FILTER, <type_mask=0x10, event_mask=...>)
+s.bind((0,))
+```
+
+* `bind` 成功（不是权限问题，我们在 `wheel` 组且 `/dev` 权限够）；
+* 但**收不到任何 HCI Event**，即使手机正在连接/断开（`bluetoothctl devices Connected`
+  能看到设备，说明连接是真发生了）。
+
+原因基本可以确定：`HCI_CHANNEL_RAW` 上的事件**只有绑定该 socket 的进程发起的命令**
+才会回报；BlueZ（bluetoothd）自己发起的连接事件不会复制给别的 raw socket。
+要看到全部事件需要 `HCI_CHANNEL_MONITOR`，而那个通道被 `CAP_NET_ADMIN` + 独占限制
+（这台机器上 `socket(AF_BLUETOOTH, SOCK_RAW, 4)` 直接返回 “unknown Bluetooth protocol”，
+内核没编 `CONFIG_BT_MONITOR`）。
+
+**结论：raw HCI 注入这条路在用户态走不通**，除非换 USB dongle 并独占它（`hci1`），
+或者改内核。两个我都不建议现在做。
+
+## 所以现在的状态
+
+```
+✅ 设备可见 / 手机连接 / 读 0x9996 / 写 300B 分享请求
+✅ P2P 持久组可加入（192.168.49.184 ↔ .49.1），USB 共享网络保上网
+❌ 我们发通知：BlueZ 要 CCCD，手机不写
+❌ 手机写 0x9986：L1() 没被调用，因为在等接收方应答
+❌ raw HCI 注入：收不到事件、MONITOR 通道不可用
+```
+
+## 唯一剩下的干净选项：给 BlueZ 打补丁
+
+`src/gatt-database.c:1422`：
+
+```c
+ccc = find_ccc_state(device_state, notify->ccc_handle);
+if (!ccc || !(ccc->value & 0x0003))
+    return;                       // ← 没有 CCCD 就丢掉通知
+```
+
+改成：
+
+```c
+ccc = find_ccc_state(device_state, notify->ccc_handle);
+if (ccc && !(ccc->value & 0x0003))
+    return;                       // 有 CCCD 但没开 → 照旧丢
+/* 没有 CCCD 状态时也发出去（对端是 ColorOS 这种只在本地置位的实现） */
+```
+
+副作用：**所有**没订阅的客户端都会收到通知。对桌面/耳机这些正常设备无所谓
+（它们会写 CCCD，走第一支），但对同样"只在本地置位"的设备（小米互传？）会多发几条
+无意义的 ATT 包——不会破坏协议，因为对端没订阅时可以忽略。
+
+## 我需要你决定
+
+1. **要不要打这个补丁**？（`asp checkout bluez` → 改 → `makepkg -si`，需要 sudo 密码，
+   重装期间蓝牙会断几秒，键鼠/耳机可能受影响。改完可以随时 `pacman -S bluez` 还原。）
+2. 如果不想动系统 BlueZ，还有一个折中：**用 BLE dongle + 自己的 bluetoothd**，
+   在独立 HCI 上跑打过补丁的 BlueZ，不碰系统那个。需要你有一个多余的 USB 蓝牙适配器。
+3. 或者，如果手机端能给出「接收方应答」的**非通知**写法（比如写到某个特征），
+   那补丁也不用打。你之前说 `w.i1()` 是 `notifyCharacteristicChanged`，
+   但 `0x9985` 的属性是 read|write——有没有可能它同时也接受**写入**作为应答？
+   `w.e.onCharacteristicWriteRequest` 里 0x9985 的分支，首字节不是 1 时走 `k()`
+   （拒绝/取消），那是不是意味着**写 0x00 等于拒绝、写 0x01 等于……」**
+   如果是，我们写 0x01 就已经算"应答"了，只是手机还要别的字段？
