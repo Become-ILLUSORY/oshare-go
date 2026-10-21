@@ -139,15 +139,43 @@ XML_APP = """
 
 
 def _wifi_info(state=0, mac="4c6978757a42", key=""):
-    """The 0x9996 payload, built the way ble/impl/w.java za.c.e() builds it."""
+    """The short 0x9996 payload (za.c.e()): {"state","mac","key"}."""
     return json.dumps({"state": state, "mac": mac, "key": key}).encode()
 
 
-# Values handed out before the phone writes anything. The phone (as the BLE
-# client) reads 0x9996 right after service discovery; leaving it empty makes it
-# report "peer busy" and give up.
+def _wifi_info_v3(mac, pubkey_b64, version=3, random_port=True):
+    """The five-field 0x9996 a phone sends: <mac>&<ver>&<EC pubkey>&1&1.
+
+    ble/impl/w.java builds it when the MTU is negotiated; the peer is expected
+    to decrypt `{"info","salt","sign"}` in the sixth field with the private key
+    matching pubkey_b64. We stop at field four: j.java treats a payload with
+    five or fewer fields as "no signature to verify" and continues.
+    """
+    # split[4] (the fifth field) becomes mBleAckPreview on the phone: "1"
+    # makes it answer with a 300-byte preview write on 0x9985; "0" sends it
+    # down the START_WPS_INFO path, where the credentials are written to
+    # 0x9986 instead.
+    fields = [mac.replace(":", "").lower(), str(version), pubkey_b64,
+              "1", "1" if random_port else "0"]
+    return "&".join(fields).encode()
+
+
+# Values handed out before the phone writes anything. What the phone reads on
+# 0x9996 decides whether it will talk to us at all: the short JSON form makes
+# it answer "status info: 0" and stall, the five-field form is what a real peer
+# sends.
+PUBKEY_FILE = os.environ.get("OSHARE_PUBKEY")
+WIFI_MAC = os.environ.get("OSHARE_WIFI_MAC", "4c6978757a42")
+if PUBKEY_FILE and os.path.exists(PUBKEY_FILE):
+    with open(PUBKEY_FILE) as fh:
+        _pub = fh.read().strip()
+    INITIAL_WIFI = _wifi_info_v3(
+        WIFI_MAC, _pub, random_port=not os.environ.get("OSHARE_NO_PREVIEW"))
+else:
+    INITIAL_WIFI = _wifi_info()
+
 INITIAL_VALUES = {
-    "WIFI_INFO": _wifi_info(),
+    "WIFI_INFO": INITIAL_WIFI,
     "SHARE_CMD": json.dumps({"state": 0}).encode(),
     "UPDATE": json.dumps({"state": 0}).encode(),
 }
