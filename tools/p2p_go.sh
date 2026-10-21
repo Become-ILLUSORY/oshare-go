@@ -29,6 +29,7 @@ say() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 
 cleanup() {
     say "cleaning up"
+    [ -f /run/oshare-dnsmasq.pid ] && kill "$(cat /run/oshare-dnsmasq.pid)" 2>/dev/null || true
     [ -S "$CTRL/$IFACE" ] && wpa_cli -p "$CTRL" -i "$IFACE" p2p_group_remove "$GO_IF" 2>/dev/null || true
     pkill -f "wpa_supplicant.*$CTRL" 2>/dev/null || true
     nmcli device set "$IFACE" managed yes 2>/dev/null || true
@@ -73,6 +74,24 @@ GO_IF=$(wpa_cli -p "$CTRL" -i "$IFACE" status | awk -F= '/^p2p_group_iface|^wpa_
 GO_IF=${GO_IF:-$(iw dev | awk '/Interface p2p-/{print $2; exit}')}
 say "GO interface: ${GO_IF:-<none>}"
 [ -n "${GO_IF:-}" ] || { say "no group interface - group_add failed"; exit 1; }
+
+# The GO is the AP: wpa_supplicant does not assign an address or run DHCP, so
+# the phone sits in DHCPDISCOVER forever unless we do it. ColorOS expects the
+# peer to be 192.168.49.1 - that is what its own GO uses and what the captures
+# show the receiver dialing.
+GO_IP_CIDR="${GO_IP_CIDR:-192.168.49.1/24}"
+if ! ip -4 addr show dev "$GO_IF" | grep -q "$GO_IP_CIDR"; then
+    ip addr add "$GO_IP_CIDR" dev "$GO_IF"
+    say "assigned $GO_IP_CIDR to $GO_IF"
+fi
+ip link set "$GO_IF" up
+
+if ! pgrep -f "dnsmasq.*$GO_IF" >/dev/null; then
+    dnsmasq --interface="$GO_IF" --bind-interfaces --dhcp-range=192.168.49.10,192.168.49.200,255.255.255.0,12h \
+            --dhcp-option=3,"${GO_IP_CIDR%%/*}" --no-resolv --no-hosts \
+            --pid-file=/run/oshare-dnsmasq.pid --log-facility=/tmp/oshare-dnsmasq.log
+    say "dnsmasq started on $GO_IF (192.168.49.10-200)"
+fi
 
 GO_IP=$(ip -4 -o addr show dev "$GO_IF" | awk '{print $4}')
 say "GO address: ${GO_IP:-<none>}"
