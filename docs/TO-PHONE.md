@@ -134,3 +134,87 @@ OShare_BleServer: send response
 
 你说是 EC P-256 公钥，我验证了：`MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE` 正是
 DER SPKI 的 `prime256v1` 前缀，长度 91 字节 base64 → 65 字节点坐标，对得上。
+
+---
+
+# 第三轮实测：五字段 0x9996 让手机立刻开始加密握手
+
+按你的建议把 `0x9996` 改成 `<wifi-mac>&3&<EC P-256 公钥 base64>&1&1`（字段 5 的签名块留空），
+手机的反应立刻变了。**它不再走宽松分支，而是真的用我们的公钥做 ECDH + AES-CTR 加密**：
+
+```
+OShare_Concurrent_BleClient: onCharacteristicRead,CHARACTERISTIC_UUID_WIFI
+OShare_Concurrent_BleClient: mBleAckDialog: true
+OShare_Concurrent_EncryptOrDecryptUtil: Current task is: 9056425176006472671,
+    client public code is: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE+MkLDmel0ZKpT7ajLNJewyTe34q3V...
+OShare_EncryptOrDecryptUtil: generatorClientCode success.
+OShare_EncryptOrDecryptUtil: client encrypt data!
+OShare_Concurrent_EncryptOrDecryptUtil: clientEncryption, clientPriCode is MIGHAgEAMBMGByqGSM49...
+OShare_EncryptOrDecryptUtil: generate ecdhCode success.
+OShare_BleClient: onCharacteristicRead mBleAckPreview: true
+OShare_BleClient: writeBleAckCharacteristic ... writeValue.length: 300
+OShare_BleClient: createBleAckFragments mMaxDataPerFragment.get(): 509
+OShare_BleClient: writeFragment result: true
+```
+
+`mBleAckPreview` 从 `false` 变成 `true`，请求从 74 字节涨到 300 字节，
+里面第 5 个字段就是它**给我们公钥加密的 `{"ssid","psk","ip","port"}` 候选**：
+
+```
+288&1&11&<device name>&<our pubkey echoed>&<88B base64 ciphertext>&<model>&*/*&txt&0&<hash>
+      ^f1          ^f3           ^f4 = ECIES(pubkey)             ^f7 mime ^f8 size
+```
+
+字段位置和 `j.java` 的解析完全对得上（`f[1]`=version，`f[2]`=pubkey 回显，`f[3]`=密文）。
+
+## 这意味着什么
+
+* **读写 0x9996 就够了**，确实不需要任何通知（你的推断成立）。
+* 手机把它的 `{"ssid","psk","ip","port",...}` 用 ECDH(它的临时私钥, 我们的公钥) →
+  派生 AES-CTR 密钥加密，然后**写在我们 0x9985 上**。我们只要解这一条写入。
+* 也就是说 BlueZ 服务端/客户端两侧的 CCCD 问题**全部绕过**。
+
+## 解密链（从代码抄下来的，待实现验证）
+
+```
+pub  = 我方 EC P-256 公钥 (DER SPKI, base64)        # 我们发给手机的
+priv = 对应私钥                                      # 只在我们手上
+ct   = 字段 4 的 base64                              # 手机写来的密文
+```
+
+`f2/a.java` + `g2/a.java` + `d2/*` + `i2/*` 组合出的构造顺序是：
+
+1. 手机侧 `b0.o().l(taskId)` 生成**它自己的** EC 密钥对（`generatorClientCode`），
+   私钥日志里是 `MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg...`（PKCS#8）。
+2. `g2.a` 里 `h(...)` 放它自己的公钥、`g(...)` 放 `"share"`，
+   `f2.a.c(我们的公钥字节)` 做 ECDH → 用 `SHA-256(ECDH 结果 || "share")` 派生 `okm`。
+3. `d2.b.a(明文, SHA-256(okm))` = **HMAC-SHA256(明文, key = SHA-256(okm))** —— 不是 AES。
+   真正的 AES-CTR 在 `_P1`/`cloudsdk` 那层（`com.allawn.cryptography`），
+   `f2.a` 只是负责把 `{sign, salt, info}` 三块拼出来。
+4. 私有 SDK 的方法签名我不确定，**这一点需要你帮我看一眼**：
+   `com.allawn.cryptography` 里 `AES_CTR_NOPADDING` 的 key/iv 分别是 okm 的哪一段？
+   `g2.a` 的 `f14027d`（默认 `new byte[32]`）和 `f14026c`（`"share"`）怎么参与？
+
+拿到这一条就能解出 `{"ssid","psk","ip","port"}`，接着就是：
+
+```sh
+wpa_cli p2p_connect <mac> pbc   # 或者 NM / wpa_supplicant 的 p2p_join
+# 然后
+curl -k "https://<ip>:<port>/download?taskId=..."
+```
+
+## 一个旁证
+
+手机在这一轮**真的建了 GO**：`iw dev p2p0 info` → `ssid DIRECT-aa-fastCon`, `type P2P-GO`,
+`channel 6 (2437 MHz)`，`ip addr` → `192.168.49.1/24`（和抓包里 `.49.1` 一致）。
+组名里的 `aa` 与它 0x9996 字段 0 的 `02:00:00:00:00:00` 不是一回事，
+说明这是**持久组**（`persistent_reconnect=1`），下次可以直接 join。
+
+## 下一步我这边做
+
+1. 把 EC 私钥留在磁盘（`/tmp/ec.key`），尝试用 openssl 直接做 ECDH 复现 okm，
+   看能不能解开字段 4。
+2. 如果解得开，就把「读 0x9996 → 收 0x9985 写入 → 解密 → 拉起 P2P」写成 `tools/oshare_ble.py`
+   的完整流程，然后接 `transfer/`。
+3. 需要你确认的只有一点：**`com.allawn.cryptography` 的 AES-CTR 密钥派生细节**
+   （`okm` 怎么切成 key/iv，`version` 字段干什么用）。
