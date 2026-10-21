@@ -38,6 +38,8 @@ ap.add_argument("--cert", default="/tmp/oshare-srv.crt")
 ap.add_argument("--key", default="/tmp/oshare-srv.key")
 ap.add_argument("--no-send-request", action="store_true",
                 help="only do version negotiation")
+ap.add_argument("--delay", type=float, default=1.5,
+                help="seconds to wait after the upgrade before announcing versions")
 ap.add_argument("--log", default="/tmp/oshare-ws.log",
                 help="also append every line here (world-readable)")
 args = ap.parse_args()
@@ -158,7 +160,7 @@ def handle_ws(sock):
     ch = Chan(sock)
     # fa/p.java sends the first action half a second after the upgrade, giving
     # the client's channel a moment to become active.
-    threading.Timer(0.5, lambda: ch.send("action", "versionNegotiation",
+    threading.Timer(args.delay, lambda: ch.send("action", "versionNegotiation",
                                          payload={"versions": VERSIONS})).start()
     try:
         while True:
