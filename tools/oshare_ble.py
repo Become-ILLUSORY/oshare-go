@@ -466,7 +466,7 @@ def parse_payload(name, text, raw):
 ACK_CHAR_UUID = "00009985-0000-1000-8000-00805f9b34fb"
 
 
-def ack_peer(bus, dev_path, payload=b"\x01", delay_ms=300):
+def ack_peer(bus, dev_path, payload=b"\x01", delay_ms=300, retries=5):
     """Write the allow-ACK to the *phone's* 0x9985 characteristic.
 
     The phone is a GATT client towards us, but its own server exposes the same
@@ -476,46 +476,50 @@ def ack_peer(bus, dev_path, payload=b"\x01", delay_ms=300):
     the CCCD (it never does), so we ACK by writing to the phone instead.
     """
 
-    def do_ack():
-        def after_connect(reply, err):
-            if err:
-                log("[ack] connect failed:", err.message)
-                return
-            log("[ack] connected to peer, looking for 0x9985")
-
-            def on_objects(reply2, err2):
-                if err2:
-                    log("[ack] GetManagedObjects failed:", err2.message)
-                    return
-                objs = reply2.unpack()[0]
-                for path, ifaces in objs.items():
+    def find_and_write(attempt=0):
+        def on_objects(reply, err):
+            chars = []
+            if not err:
+                for path, ifaces in reply.unpack()[0].items():
                     if "org.bluez.GattCharacteristic1" not in ifaces:
                         continue
                     props = ifaces["org.bluez.GattCharacteristic1"]
-                    if str(props.get("UUID", "")).lower() != ACK_CHAR_UUID:
-                        continue
-                    log(f"[ack] writing {payload.hex()} to {path}")
+                    if str(props.get("UUID", "")).lower() == ACK_CHAR_UUID:
+                        chars.append(str(path))
+            if not chars:
+                if attempt < retries:
+                    log(f"[ack] 0x9985 not visible yet (attempt {attempt + 1}), retrying")
+                    GLib.timeout_add(700, lambda: (find_and_write(attempt + 1), False)[1])
+                else:
+                    log("[ack] gave up: 0x9985 not in the peer's GATT tree")
+                return
+            for path in chars:
+                log(f"[ack] writing {payload.hex()} to {path}")
 
-                    def done(reply3, err3):
-                        if err3:
-                            log("[ack] WriteValue failed:", err3.message)
-                        else:
-                            log("[ack] peer acknowledged (write ok)")
+                def done(reply2, err2):
+                    if err2:
+                        log("[ack] WriteValue failed:", err2.message)
+                    else:
+                        log("[ack] peer acknowledged (write ok)")
 
-                    bus.call(str(path), "org.bluez.GattCharacteristic1",
-                             "WriteValue",
-                             GLib.Variant("(aya{sv})", (payload, {"offset": GLib.Variant("q", 0)})),
-                             done, timeout=10)
-                    return
-                log("[ack] 0x9985 not found in the peer's GATT tree")
+                bus.call(path, "org.bluez.GattCharacteristic1", "WriteValue",
+                         GLib.Variant("(aya{sv})", (payload, {})), done, timeout=15)
 
-            bus.call("/", "org.freedesktop.DBus.ObjectManager",
-                     "GetManagedObjects", None, on_objects, timeout=10)
+        bus.call("/", "org.freedesktop.DBus.ObjectManager",
+                 "GetManagedObjects", None, on_objects, timeout=10)
 
+    def after_connect(reply, err):
+        if err:
+            log("[ack] connect failed:", err.message)
+            return
+        log("[ack] connected to peer, scanning its GATT tree for 0x9985")
+        GLib.timeout_add(400, lambda: (find_and_write(), False)[1])
+
+    def kick():
         bus.call(dev_path, "org.bluez.Device1", "Connect", None, after_connect,
-                 timeout=20)
+                 timeout=25)
 
-    GLib.timeout_add(delay_ms, lambda: (do_ack(), False)[1])
+    GLib.timeout_add(delay_ms, lambda: (kick(), False)[1])
 
 
 def find_adapter(bus, want=None):

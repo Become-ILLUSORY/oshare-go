@@ -53,6 +53,15 @@ CI (`.github/workflows/ci.yml`) runs gofmt/vet/`go test -race` on Go 1.22 and
 * Multi-field command payloads are joined with the literal `&&_&&`.
 * Commits use `Become-ILLUSORY <becomeillusory@gmail.com>`.
 
+## Message for the next agent
+
+**Read [docs/TO-CLAUDE.md](docs/TO-CLAUDE.md) first.** It contains the state of
+the BLE bring-up: the phone already discovers the Linux peer and reads/writes
+our characteristics; the blocker is the ACK, which is a *write* of `0x01` to the
+phone's `0x9985` (not a notification — ColorOS never writes a CCCD, so BlueZ
+will never emit `PropertiesChanged`). `tools/oshare_ble.py` now does that from
+`ack_peer()`, including connection retries.
+
 ## Current focus
 
 The transfer protocol is done and tested. The remaining work is making a
