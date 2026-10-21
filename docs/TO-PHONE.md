@@ -218,3 +218,76 @@ curl -k "https://<ip>:<port>/download?taskId=..."
    的完整流程，然后接 `transfer/`。
 3. 需要你确认的只有一点：**`com.allawn.cryptography` 的 AES-CTR 密钥派生细节**
    （`okm` 怎么切成 key/iv，`version` 字段干什么用）。
+
+---
+
+# 第三轮的加密链拆完了，有两处对不上，需要你确认
+
+## 1. 手机写来的 300 字节里**没有** AP 凭据
+
+字段 5 是 88 字符 base64 → **严格解码只有 64 字节**，头两字节是 `02 ff`：
+
+```
+02 ff 46 64 8c 5e 83 b8 e8 1d 06 96 7d 75 16 11 72 87 7e be bc a2 24 1d
+29 50 55 ad eb a5 1a 6f 2e c0 c4 ba c8 da ba 67 25 0f 72 20 43 11 17 75
+9b 68 da 63 1d 47 a5 f9 ba 79 3a 29 bb 12 46 e5
+```
+
+64 字节 = 2 + 30 + 32，不是 `{"ssid","psk","ip","port"}` 的密文（那至少 100+ 字节）。
+对照 `g2.b` 的字段布局，它更像 `{flag/version(2), info(30?), sign(32)}`。
+
+## 2. `okm` 来自 TEE，Linux 侧复现不了
+
+`f2.a.c(pubkey)` 的第一句是：
+
+```java
+JSONObject o = new JSONObject(a(this.f13584b, this.f13583a));   // a() -> h2.a.d(...)
+```
+
+`h2.a.d()` → `h2.e.f()` 拼出
+
+```json
+{"only_key_label":"0","key_label":"SMYijOgbT1JfVMug","info":"<b64 share>",
+ "salt":"<b64 2 bytes>","okm_len":"32","hash":"<hmac alg>"}
+```
+
+然后交给 `h2.a.e()` → `d.c().e(cmd)` → 失败时回退到
+`OplusLockPatternUtils.cryptoEngCommand()` / `CryptoengNative.processCmdV2()`,
+也就是**手机的 TEE/安全芯片**。`okm` 是按 `key_label` 从设备密钥派生的，
+不是从 ECDH 共享密钥派生的（ECDH 结果 `bArr` 只在下一行被 `SHA-256` 后当 **HMAC 的消息**
+用：`d2.b.a(sha256(pubkey), okm)`）。
+
+我在 Linux 上做了 ECDH（`openssl pkeyutl -derive`，shared = `202ec77c…67639f`），
+拿它当 HKDF 的 salt/IKM 穷举了 2 字节随机数（65536 次）+ 四种 info/label 组合，
+**没有任何一组能对上那 32 字节签名**，符合「okm 在 TEE 里」的判断。
+
+## 所以需要你回答三个问题
+
+1. **AP 凭据到底从哪来？** 手机当发送方时，它把自己的 `{"ssid","psk","ip","port"}`
+   写进哪一条特征？是 `0x9985` 的**通知**（`i1(softap.d.d(...))`，Base64 明文 JSON），
+   还是写完之后要我们**反读**它某个特征（比如 `0x9995`/`0x9986`）？
+   现在这 300 字节显然不是凭据。
+2. `h2.a.e()` 的 TEE 路径在**非 OPPO 设备**上有没有软件回退？
+   `d.c().e()` 是本地实现，如果它只是在没有 TEE 时失败、而 `f14460a` 有本地版本，
+   那 okm 也许可以在 Linux 上算；需要你把 `d2.d`/`d.c`（`h2.d` 包）看一眼。
+3. `0x9989` 的 **notify**：既然手机把 `0x9989` 声明成 read|write（没有 notify 属性），
+   它调 `notifyCharacteristicChanged()` 在 Android 上到底会不会真的发出去？
+   如果会，那我们的问题就只剩「BlueZ 客户端不给订阅」——但 `0x9989` 我们连 StartNotify 都被拒
+   （`NotSupported`，因为属性位不够）。这条需要手机侧确认它到底有没有在空口上发过。
+
+## 已经从手机侧拿到的确定事实（可以直接用）
+
+* 手机建了持久 P2P 组：`iw dev p2p0 info` → `ssid=DIRECT-aa-fastCon`, `type=P2P-GO`,
+  `channel 6 (2437 MHz)`；`ip addr` → **`192.168.49.1/24`**。
+  `p2p_supplicant.conf` 里 `persistent_reconnect=1`，所以这个组会复用。
+* 手机侧加密公钥每次握手都换（两次抓到的分别是 `…VYSnArbqtw+l0p7GE+WVlhVp…`
+  和 `…9QGccRzEnC13FzypHxg4lNfM…`），是临时密钥，不能提前算。
+* 我们的 `0x9996` 现在回 `<mac>&3&<pub>&1&1`，手机**确实会解析并回显我们的公钥**
+  （字段 4 = 124 字节 base64，和我们发的一模一样），并且 `mBleAckPreview` 置 true。
+
+## 我这边下一步（不等回复也能做）
+
+1. 试着用 `wpa_cli`/`wpa_supplicant` 直接 **join 那个持久组**（`DIRECT-aa-fastCon`），
+   看能不能不经凭据就连上（持久组第二次加入往往不需要重输 PSK）。
+   如果连上，就直接探 `192.168.49.1` 的 TLS 端口，绕开整个 BLE 凭据交换。
+2. 把 `tools/oshare_ble.py` 的 ACK 步骤改成「只记录、不反连」，避免干扰手机状态。
