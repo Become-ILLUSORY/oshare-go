@@ -87,9 +87,17 @@ fi
 ip link set "$GO_IF" up
 
 if ! pgrep -f "dnsmasq.*$GO_IF" >/dev/null; then
-    dnsmasq --interface="$GO_IF" --bind-interfaces --dhcp-range=192.168.49.10,192.168.49.200,255.255.255.0,12h \
-            --dhcp-option=3,"${GO_IP_CIDR%%/*}" --no-resolv --no-hosts \
+    # --bind-dynamic, not --bind-interfaces: the P2P GO interface appears after
+    # wpa_supplicant creates the group, so a static bind misses its sockets.
+    # --log-dhcp makes the offer/ack visible in the log when the phone gives up.
+    rm -f /run/oshare-dnsmasq.pid
+    dnsmasq --interface="$GO_IF" --bind-dynamic \
+            --dhcp-range=192.168.49.10,192.168.49.200,255.255.255.0,12h \
+            --dhcp-option=3,"${GO_IP_CIDR%%/*}" --dhcp-option=6,"${GO_IP_CIDR%%/*}" \
+            --dhcp-authoritative --log-dhcp \
+            --no-resolv --no-hosts \
             --pid-file=/run/oshare-dnsmasq.pid --log-facility=/tmp/oshare-dnsmasq.log
+    chmod 644 /tmp/oshare-dnsmasq.log 2>/dev/null || true
     say "dnsmasq started on $GO_IF (192.168.49.10-200)"
 fi
 
