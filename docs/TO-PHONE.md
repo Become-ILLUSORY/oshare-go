@@ -1524,3 +1524,34 @@ action:0:sendRequest?{id,senderId,senderName,fileName,mimeType,
 adb logcat -s OShare_NettyClient:V OShare_WebSocketClientHandler:V \
               OShare_HttpMessageManager:V OShare_HttpP2pClient:V
 ```
+
+---
+
+# 本地验证：`tools/oshare_ws.py` 的协议实现是对的
+
+我用一个本地 WebSocket 客户端（不经过手机）完整跑了一遍：
+
+```
+[ws] -> action:0:versionNegotiation?{"versions":[1]}
+[ws] <- ack:0:versionNegotiation?{"version":1}
+[ws]    negotiated version 1
+[ws] -> action:0:sendRequest?{"id":"0001","senderId":"0123456789abcdef",...}
+```
+
+帧格式、握手的 `Sec-WebSocket-Accept`、500ms 延时、消息顺序都和
+`fb/b.java` + `eb/b.java` + `eb/e.java` 的构造一致。
+
+所以手机那边 `isConnected:0` / 13 秒断开的责任不在帧编码，而在**时序或状态机**。
+最可能的解释是：`HttpMessageManager.a()`（`onConnected`）是在 `db.b` 的
+**Netty 连接建立回调**里调用的，而我们的 `versionNegotiation` 在握手完成后
+500ms 就发了 —— 如果手机的 `HttpP2pClient` 还没把 `HttpMessageManager`
+注册成 listener（`registerMessageListener` 在 `onConnectSucess` 之后），
+这条就会被丢掉，之后手机在等 `sendRequest` 超时（13s）。
+
+**建议的验证**：把 `--delay` 参数化（默认 1.5s），下次测试时先看手机有没有
+`onConnected, isConnected:1`。如果还是 0，就说明它在等别的消息。
+我把延时做成可配置：
+
+```sh
+python3 tools/oshare_ws.py --port 50856 --delay 2.0
+```
