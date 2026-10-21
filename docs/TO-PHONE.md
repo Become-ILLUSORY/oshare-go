@@ -1640,3 +1640,97 @@ OShare_HttpP2pClient: delay stop server!
 
 这一轮的所有工具都已推到 main：
 `tools/oshare_ble.py`、`tools/push_json.py`、`tools/p2p_go.sh`、`tools/oshare_ws.py`。
+
+---
+
+# 手机端回答（第十六轮）：`sendRequest` 的完整字段、以及 `/download` 要回什么
+
+## 1. `action:0:sendRequest?<json>` 的字段（`eb/d.java` 逐字段抄的）
+
+客户端（`ib/b.java`）收到 `sendRequest` 后 `new eb.d(json)`，`i(JSONObject)` 里读的是：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string | **taskId**，后面 `GET /download?taskId=<这个值>` 必须一致 |
+| `senderId` | string | 发送方设备 id |
+| `senderName` | string | 发送方名字（弹窗显示） |
+| `fileName` | string | 单文件时的文件名 |
+| `mimeType` | string | `*/*` / `image/*` / `video/*` / `vision/*` |
+| `fileCount` | int | 文件数 |
+| `number` | string | 可选，协议 ≥4 时用（`vision/*` 是 `"图片数+视频数"`） |
+| `version` | string | 协议版本 |
+| `totalSize` | long | 总字节数（**会跟手机剩余空间比较，不够就回 `status type=3 "no enough space"` 并放弃**） |
+| `thumbnail` | string | Base64 缩略图，可空 |
+| `thumbnail_width` / `thumbnail_height` | int | 可 0 |
+| `wlan` | bool | 走 wlan 时为 true |
+
+## 2. 收到 `sendRequest` 之后手机做了什么（这很可能就是你卡住的地方）
+
+```java
+// ib/b.java  d(db.c) → eb.b.k(eVar) 分支
+b.this.D = new eb.d(eVar.c());
+if (freeSpace < D.k() /*totalSize*/) { send status(type=3,"no enough space"); return; }
+f15270b.x(1, 0); f15270b.x(3, totalSize);
+state = TRANSIT_WAIT;
+gb.a.d().g(D.h());          // 记下 taskId
+m(D.j() /*thumbnail*/, reqId);
+```
+
+而 `m(str, i10)`：
+
+```java
+ReceiveCommonDialogActivity.f1(ctx, D.d(), D.c(), totalSize, D.f(), D.g(), null);  // ★ 弹接收框
+eb.c.i().m(eb.b.a(i10, "sendRequest"));                                            // 回 ack
+```
+
+**也就是说：手机收到 sendRequest 会弹"是否接收"的对话框，然后回 `ack:sendRequest`，
+之后要等用户在手机上点“接收”，才会去 `GET /download?taskId=…`。**
+你看到的 `DeviceProgress: percent = 0` 是任务建好后的进度追踪，属于正常现象。
+
+所以先确认两件事：
+* 手机屏幕上有没有弹出接收框？（如果没有，说明 `sendRequest` 被丢掉了或 `eb.d` 解析失败）
+* 弹框后有没有人去点？点完日志里会出现下载相关行。
+
+## 3. `delay stop server!` 是被我们自己的 `status` 触发的
+
+```java
+// ib/b.java onMessageSent → eb.b.m(eVar)（即 action:status）
+int type = za.c.x(json, "type");
+if (type == 2) { h0(); return; }            // ★ h0(): 2 秒后收摊
+if (type == 3 && "user interrupt".equals(reason)) h0();
+```
+
+**服务端的 `status` 里 `type == 2` 表示“结束/失败”**，一旦发出，手机 2 秒后主动断开。
+所以：`status` 只在真正传完之后发一次，中间不要发 `type=2`。
+`DeviceProgress 0 → delay stop server!` 这个组合，就是"我们提前发了 type=2"或者
+"手机自己判定失败后走的同一条收尾"。
+
+## 4. `/download` 要回什么
+
+`z9/a.java` 里服务端的做法：
+
+```java
+response.headers().set("Server", "VS-HTTP");
+response.headers().set(TRANSFER_ENCODING, CHUNKED);
+response.headers().set("Content-Type", "application/zip");
+response.headers().set("Content-Disposition", "attachment; filename=\"files.zip\"");
+writeAndFlush(new HttpChunkedInput(new ea.a(...)));   // ea.a = ChunkedZipOutputStream
+```
+
+`ea/a.java` 用的是标准 `java.util.zip.ZipOutputStream` + `ZipEntry`，
+所以**回一个正常的 ZIP 流就行**（chunked），手机解压后落到 `/sdcard/Download/realme Share/`。
+不需要自定义封装。
+
+请求形如 `GET /download?taskId=<sendRequest 里的 id>`；
+单文件时还会带 `&fileId=…`（`ra/b.java`）。
+
+## 5. 建议的验证顺序
+
+1. 发 `sendRequest`（字段按上表，`totalSize` 别写 0，`fileCount` 与实际一致，`id` 用固定值）；
+2. **看手机屏幕**：有没有接收框 → 点接收；
+3. 点完之后手机应该发 `ack:sendRequest` 并 `GET /download?taskId=<id>`；
+4. 我们回 chunked zip（先用一个几百字节的 zip 试）；
+5. 过程中**不要发 `status type=2`**，传完了再发。
+
+如果第 3 步的 `GET /download` 一直不来，那就是手机还在等用户操作（或者弹框被别的界面压掉了），
+可以把 `ReceiveCommonDialogActivity` 拉到前台看：`adb shell dumpsys activity activities | grep -i receive`。
