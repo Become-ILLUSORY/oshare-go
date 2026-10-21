@@ -176,7 +176,16 @@ Two pcaps from the real transfers (attack vector: root `AF_PACKET` on `p2p0`):
 * `cap_p2p2.pcap` — Xiaomi → OPPO, 10 MB, Xiaomi = `.1` (GO), phone = `.128`,
   data port 54377, file saved as `base.apk`
 
-They are attached to the GitHub release `captures-2026-10-21` (too big for git).
+They are attached to the GitHub release
+[`captures-2026-10-21`](https://github.com/Become-ILLUSORY/oshare-go/releases/tag/captures-2026-10-21)
+(`cap.pcap` plus `cap_p2p.pcap` split into `p2p.part-*` because the upload path
+resets around 60 MB):
+
+```sh
+cat p2p.part-aa p2p.part-ab p2p.part-ac p2p.part-ad p2p.part-ae > cap_p2p.pcap
+sha256sum cap_p2p.pcap   # a8bc73c6d519e797d62bec43bf36274d2225eb90c03eaa53925426b7c732192b
+```
+
 Helper scripts used on the device are not committed; re-create them if needed:
 
 * raw pcap writer — Go, `AF_PACKET` on an interface, writes classic pcap
