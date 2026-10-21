@@ -1,0 +1,10 @@
+# build output
+/dist/
+/oshare
+/oshare-*
+*.exe
+
+# editor / OS noise
+.DS_Store
+.idea/
+.vscode/
