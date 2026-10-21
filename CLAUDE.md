@@ -64,14 +64,24 @@ will never emit `PropertiesChanged`). `tools/oshare_ble.py` now does that from
 
 ## Current focus
 
-The transfer protocol is done and tested. The remaining work is making a
-**Linux box discoverable by an unmodified ColorOS phone**:
+The Go transfer protocol and the Linux ↔ phone path are **both working**. The
+phone side was solved in `tools/` (Python) on 2026-10-21: see
+[docs/USAGE.md](docs/USAGE.md) for the user guide and
+[docs/TO-PHONE.md](docs/TO-PHONE.md) for the evidence trail.
 
-1. `tools/oshare_ble.py serve` advertises as a share peer and hosts the GATT
-   server — needs a real run on a laptop with a BLE adapter (CachyOS).
-2. Confirm the phone lists the peer and writes `START_WPS_INFO` /
-   `PORT_FREQUENCY`; those carry the Wi-Fi Direct credentials + port.
-3. Join the group and drive `transfer/`'s TLS client against
-   `https://<phone>:<port>/download?taskId=…`.
+`tools/oshare-go.sh` is the one-command entry point: it creates a Wi-Fi Direct
+group owner, runs DHCP + the wss:// control channel + `/download`, advertises
+over BLE, and pushes the AP/port to the phone when it asks. The one thing that
+made this work without patching BlueZ: **no GATT notifications are used at
+all** — the phone reads our `0x9996`, writes its share request to `0x9985`, and
+we read `0x9954` then write the JSON to `0x9953`, which makes the phone dial us.
 
-See "Open tasks" at the end of `docs/HANDOFF.md` for the exact checklist.
+Remaining work:
+
+1. Port the Python control channel (`wss://…/websocket`, `sendRequest`,
+   chunked `/download`) into Go, on top of `transfer/`.
+2. Reverse direction (phone → Linux) still discovers the phone's port by
+   scanning, because that port only travels in a `0x9989` notification BlueZ
+   cannot receive.
+3. Clean up the exploratory scripts (`p2p_probe.sh`, `raw_notify.py`,
+   `probe_peer.py`, `watch_notify.py`) or fold them into `oshare_ble.py`.
